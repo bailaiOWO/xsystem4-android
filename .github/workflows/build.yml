@@ -91,8 +91,8 @@ jobs:
             "#define DEFAULT_FONT_GOTHIC \"fonts/VL-Gothic-Regular.ttf\"",
             "#define DEFAULT_FONT_GOTHIC \"fonts/HanaMinA.ttf\""
         )
-        target = "static struct font *get_font(unsigned face)\n{\n\tif (face > 255) {"
-        replacement = "static struct font *get_font(unsigned face)\n{\n\treturn font_ttf[FONT_MINCHO];\n\tif (face > 255) {"
+        target = "static struct font *get_font(unsigned face)\n{\n\tif (face > 255) {\n\t\tface -= 256;\n\t\tif (face >= MAX_FNL_FONTS || !font_fnl[face]) {\n\t\t\tWARNING(\"Invalid fnl face: %u\", face);\n\t\t\treturn font_ttf[0];\n\t\t}\n\t\treturn font_fnl[face];\n\t}\n\tif (face > 1)\n\t\treturn font_ttf[0];\n\treturn font_ttf[face];\n}"
+        replacement = "static struct font *get_font(unsigned face)\n{\n\tif (face > 255) {\n\t\tface -= 256;\n\t\tif (face >= MAX_FNL_FONTS || !font_fnl[face]) {\n\t\t\tWARNING(\"Invalid fnl face: %u\", face);\n\t\t\treturn font_ttf[FONT_MINCHO];\n\t\t}\n\t\treturn font_fnl[face];\n\t}\n\t// CN: force HanaMinA for TTF faces (keep FNL bitmap fonts working)\n\treturn font_ttf[FONT_MINCHO];\n}"
         assert target in c, "target in text.c not found"
         c = c.replace(target, replacement, 1)
         with open("src/text.c", "w") as f:
