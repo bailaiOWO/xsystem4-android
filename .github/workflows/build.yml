@@ -19,6 +19,14 @@ jobs:
     - name: Install Deps
       run: sudo apt-get update && sudo apt-get install -y ninja-build
 
+    - name: Apply engine patches (Sengoku Rance CN HLL fixes)
+      run: |
+        cd $GITHUB_WORKSPACE/xsystem4
+        for p in ../patches/*.patch; do
+          echo "Applying $p"
+          git apply "$p"
+        done
+
     - name: Apply GBK Patch
       run: |
         cd $GITHUB_WORKSPACE/xsystem4/subprojects/libsys4

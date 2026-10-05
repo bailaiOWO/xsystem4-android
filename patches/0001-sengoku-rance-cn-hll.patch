@@ -1,0 +1,202 @@
+diff --git a/include/sprite.h b/include/sprite.h
+index 675368d..05396c6 100644
+--- a/include/sprite.h
++++ b/include/sprite.h
+@@ -55,6 +55,8 @@ struct sact_sprite {
+ 		int char_space;
+ 		int line_space;
+ 		int current_line_height;
++		// Width of the most recent sprite_text_draw() call (for backspace)
++		int last_draw_width;
+ 	} text;
+ 	// The sprite handle
+ 	int no;
+@@ -124,6 +126,8 @@ void sprite_text_clear(struct sact_sprite *sp);
+ void sprite_text_home(struct sact_sprite *sp, int size);
+ void sprite_text_new_line(struct sact_sprite *sp, int size);
+ void sprite_text_copy(struct sact_sprite *dsp, struct sact_sprite *ssp);
++void sprite_text_scroll(struct sact_sprite *sp, int dx, int dy);
++void sprite_text_back_space(struct sact_sprite *sp);
+ static inline int sprite_get_text_home_x(struct sact_sprite *sp) { return sp->text.home.x; }
+ static inline int sprite_get_text_home_y(struct sact_sprite *sp) { return sp->text.home.y; }
+ static inline int sprite_get_text_char_space(struct sact_sprite *sp) { return sp->text.char_space; }
+diff --git a/src/hll/SACT2.c b/src/hll/SACT2.c
+index 94fb24d..10777e7 100644
+--- a/src/hll/SACT2.c
++++ b/src/hll/SACT2.c
+@@ -212,7 +212,7 @@ int sact_Effect(int type, int time, possibly_unused int key)
+ }
+ 
+ HLL_WARN_UNIMPLEMENTED(1, int, SACT2, EffectSetMask, int cg);
+-//int SACT2_EffectSetMaskSP(int sp);
++HLL_WARN_UNIMPLEMENTED(1, int, SACT2, EffectSetMaskSP, int sp);
+ 
+ void sact_QuakeScreen(int amp_x, int amp_y, int time, int key)
+ {
+@@ -605,7 +605,21 @@ int sact_SP_TextNewLine(int sp_no, int size)
+ 	return 1;
+ }
+ 
+-//int SACT2_SP_TextBackSpace(int sp_no);
++int sact_SP_TextScroll(int sp_no, int dx, int dy)
++{
++	struct sact_sprite *sp = sact_try_get_sprite(sp_no);
++	if (!sp) return 0;
++	sprite_text_scroll(sp, dx, dy);
++	return 1;
++}
++
++int sact_SP_TextBackSpace(int sp_no)
++{
++	struct sact_sprite *sp = sact_try_get_sprite(sp_no);
++	if (!sp) return 0;
++	sprite_text_back_space(sp);
++	return 1;
++}
+ 
+ int sact_SP_TextCopy(int dno, int sno)
+ {
+@@ -774,7 +788,10 @@ int sact_Joypad_IsKeyDown(int num, int key)
+ 	return joy_key_is_down(key);
+ }
+ 
+-//int SACT2_Joypad_GetNumof(void);
++int sact_Joypad_GetNumof(void)
++{
++	return 0;
++}
+ HLL_WARN_UNIMPLEMENTED( , void, SACT2, JoypadQuake_Set, int num, int type, int magnitude);
+ 
+ bool sact_Joypad_GetAnalogStickStatus(int num, int type, float *degree, float *power)
+@@ -825,7 +842,13 @@ int sact_CG_IsExist(int cg_no)
+ //void SACT2_CSV_SetInt(int line, int column, int data);
+ //void SACT2_CSV_Realloc(int lines, int columns);
+ 
++int sact_Sound_PrepareFromFile(int ch, struct string *filename)
++{
++	return wav_prepare_from_file(ch, filename->text);
++}
++
+ //void SACT2_CG_RotateRGB(int dst, int dx, int dy, int w, int h, int rotate_type);
++HLL_WARN_UNIMPLEMENTED( , void, SACT2, CG_RotateRGB, int dst, int dx, int dy, int w, int h, int rotate_type);
+ 
+ void sact_CG_BlendAMapBin(int dst, int dx, int dy, int src, int sx, int sy, int w, int h, int border)
+ {
+@@ -839,7 +862,12 @@ void sact_CG_BlendAMapBin(int dst, int dx, int dy, int src, int sx, int sy, int
+ }
+ 
+ //void SACT2_Debug_Pause(void);
+-//void SACT2_Debug_GetFuncStack(struct string **s, int nest);
++
++void sact_Debug_GetFuncStack(struct string **s, int nest)
++{
++	(void)nest;
++	*s = cstr_to_string("");
++}
+ 
+ int sact_SP_SetBrightness(int sp_no, int brightness)
+ {
+@@ -877,7 +905,7 @@ HLL_WARN_UNIMPLEMENTED(0, int, SACT2, Music_AnalyzeSampleData, struct page **l,
+ 	    HLL_EXPORT(Update, sact_Update), \
+ 	    HLL_EXPORT(Effect, sact_Effect), \
+ 	    HLL_EXPORT(EffectSetMask, SACT2_EffectSetMask), \
+-	    HLL_TODO_EXPORT(EffectSetMaskSP, SACT2_EffectSetMaskSP), \
++	    HLL_EXPORT(EffectSetMaskSP, SACT2_EffectSetMaskSP), \
+ 	    HLL_EXPORT(QuakeScreen, sact_QuakeScreen), \
+ 	    HLL_TODO_EXPORT(QUAKE_SET_CROSS, SACT2_QUAKE_SET_CROSS), \
+ 	    HLL_TODO_EXPORT(QUAKE_SET_ROTATION, SACT2_QUAKE_SET_ROTATION), \
+@@ -917,7 +945,8 @@ HLL_WARN_UNIMPLEMENTED(0, int, SACT2, Music_AnalyzeSampleData, struct page **l,
+ 	    HLL_EXPORT(SP_TextClear, sact_SP_TextClear), \
+ 	    HLL_EXPORT(SP_TextHome, sact_SP_TextHome), \
+ 	    HLL_EXPORT(SP_TextNewLine, sact_SP_TextNewLine), \
+-	    HLL_TODO_EXPORT(SP_TextBackSpace, SACT2_SP_TextBackSpace), \
++	    HLL_EXPORT(SP_TextScroll, sact_SP_TextScroll), \
++	    HLL_EXPORT(SP_TextBackSpace, sact_SP_TextBackSpace), \
+ 	    HLL_EXPORT(SP_TextCopy, sact_SP_TextCopy), \
+ 	    HLL_EXPORT(SP_GetTextHomeX, sact_SP_GetTextHomeX), \
+ 	    HLL_EXPORT(SP_GetTextHomeY, sact_SP_GetTextHomeY), \
+@@ -938,7 +967,7 @@ HLL_WARN_UNIMPLEMENTED(0, int, SACT2, Music_AnalyzeSampleData, struct page **l,
+ 	    HLL_EXPORT(Mouse_GetWheel, mouse_get_wheel), \
+ 	    HLL_EXPORT(Joypad_ClearKeyDownFlag, sact_Joypad_ClearKeyDownFlag), \
+ 	    HLL_EXPORT(Joypad_IsKeyDown, sact_Joypad_IsKeyDown), \
+-	    HLL_TODO_EXPORT(Joypad_GetNumof, SACT2_Joypad_GetNumof), \
++	    HLL_EXPORT(Joypad_GetNumof, sact_Joypad_GetNumof), \
+ 	    HLL_EXPORT(JoypadQuake_Set, SACT2_JoypadQuake_Set), \
+ 	    HLL_EXPORT(Joypad_GetAnalogStickStatus, sact_Joypad_GetAnalogStickStatus), \
+ 	    HLL_EXPORT(Joypad_GetDigitalStickStatus, sact_Joypad_GetDigitalStickStatus), \
+@@ -1002,13 +1031,13 @@ HLL_WARN_UNIMPLEMENTED(0, int, SACT2, Music_AnalyzeSampleData, struct page **l,
+ 	    HLL_EXPORT(Sound_GetVolume, wav_get_volume), \
+ 	    HLL_EXPORT(Sound_GetTimeLength, wav_get_time_length), \
+ 	    HLL_EXPORT(Sound_GetGroupNum, wav_get_group_num), \
+-	    HLL_TODO_EXPORT(Sound_PrepareFromFile, SACT2_Sound_PrepareFromFile), \
++	    HLL_EXPORT(Sound_PrepareFromFile, sact_Sound_PrepareFromFile), \
+ 	    HLL_EXPORT(System_GetDate, get_date), \
+ 	    HLL_EXPORT(System_GetTime, get_time), \
+-	    HLL_TODO_EXPORT(CG_RotateRGB, SACT2_CG_RotateRGB), \
++	    HLL_EXPORT(CG_RotateRGB, SACT2_CG_RotateRGB), \
+ 	    HLL_EXPORT(CG_BlendAMapBin, sact_CG_BlendAMapBin), \
+ 	    HLL_TODO_EXPORT(Debug_Pause, SACT2_Debug_Pause), \
+-	    HLL_TODO_EXPORT(Debug_GetFuncStack, SACT2_Debug_GetFuncStack), \
++	    HLL_EXPORT(Debug_GetFuncStack, sact_Debug_GetFuncStack), \
+ 	    HLL_EXPORT(SP_GetAMapValue, sact_SP_GetAMapValue), \
+ 	    HLL_EXPORT(SP_GetPixelValue, sact_SP_GetPixelValue), \
+ 	    HLL_EXPORT(SP_SetBrightness, sact_SP_SetBrightness), \
+diff --git a/src/sprite.c b/src/sprite.c
+index e845f88..126eb32 100644
+--- a/src/sprite.c
++++ b/src/sprite.c
+@@ -405,7 +405,9 @@ void sprite_text_draw(struct sact_sprite *sp, struct string *text, struct text_s
+ 	}
+ 
+ 	ts->font_spacing = sp->text.char_space;
+-	sp->text.pos.x += gfx_render_text(&sp->text.texture, sp->text.pos.x, sp->text.pos.y, text->text, ts, false);
++	float w = gfx_render_text(&sp->text.texture, sp->text.pos.x, sp->text.pos.y, text->text, ts, false);
++	sp->text.pos.x += w;
++	sp->text.last_draw_width = (int)w;
+ 	if (sp->text.current_line_height < ts->size)
+ 		sp->text.current_line_height = ts->size;
+ 	sprite_dirty(sp);
+@@ -447,9 +449,43 @@ void sprite_text_copy(struct sact_sprite *dsp, struct sact_sprite *ssp)
+ 	dsp->text.char_space = ssp->text.char_space;
+ 	dsp->text.line_space = ssp->text.line_space;
+ 	dsp->text.current_line_height = ssp->text.current_line_height;
++	dsp->text.last_draw_width = ssp->text.last_draw_width;
+ 	sprite_dirty(dsp);
+ }
+ 
++void sprite_text_scroll(struct sact_sprite *sp, int dx, int dy)
++{
++	if (!sp->text.texture.handle)
++		return;
++
++	struct texture tmp;
++	gfx_init_texture_rgba(&tmp, sp->text.texture.w, sp->text.texture.h, COLOR(0, 0, 0, 0));
++	gfx_copy(&tmp, dx, dy, &sp->text.texture, 0, 0, sp->text.texture.w, sp->text.texture.h);
++	gfx_copy(&sp->text.texture, 0, 0, &tmp, 0, 0, tmp.w, tmp.h);
++	gfx_delete_texture(&tmp);
++
++	sp->text.pos.x += dx;
++	sp->text.pos.y += dy;
++	sprite_dirty(sp);
++}
++
++void sprite_text_back_space(struct sact_sprite *sp)
++{
++	if (!sp->text.texture.handle || sp->text.last_draw_width <= 0)
++		return;
++
++	int x = sp->text.pos.x - sp->text.last_draw_width;
++	if (x < 0)
++		x = 0;
++	// erase the pixels of the last drawn character(s)
++	gfx_fill_alpha_color(&sp->text.texture, x, sp->text.pos.y,
++			sp->text.pos.x - x,
++			sp->text.texture.h - sp->text.pos.y, 0, 0, 0, 0);
++	sp->text.pos.x = x;
++	sp->text.last_draw_width = 0;
++	sprite_dirty(sp);
++}
++
+ bool sprite_is_point_in_rect(struct sact_sprite *sp, int x, int y)
+ {
+ 	Point p = POINT(x, y);
