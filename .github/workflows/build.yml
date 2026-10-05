@@ -68,12 +68,13 @@ jobs:
         \t}
         \tuint8_t b1 = *src;
         \tuint8_t b2 = *(src + 1);
-        \t// CN fix: SJIS full-width chars (0-9 A-z % / kana) must keep their
-        \t// SJIS meaning; the GBK table would misread them as rare hanzi.
+        \t// CN fix: engine emits full-width forms (0-9 A-z % /) as SJIS codes
+        \t// at runtime; GBK table would misread them as rare hanzi (1 -> 侾).
+        \t// SJIS wins ONLY in the U+FF01-FF5E block (corpus-validated).
         \tbool sjis_valid_fb = (b1 >= 0x81 && b1 <= 0x9f) || (b1 >= 0xe0 && b1 <= 0xfc);
         \tif (sjis_valid_fb && b2 >= 0x40 && b2 <= 0xfc && b2 != 0x7f) {
         \t\tint sjis_ucs = s2u[b1 - 0x80][b2 - 0x40];
-        \t\tif (sjis_ucs && !(sjis_ucs >= 0x4E00 && sjis_ucs <= 0x9FFF)) {
+        \t\tif (sjis_ucs >= 0xFF01 && sjis_ucs <= 0xFF5E) {
         \t\t\t*dst = sjis_ucs;
         \t\t\treturn (char*)src + 2;
         \t\t}
@@ -92,27 +93,26 @@ jobs:
             f.write(c)
         '
 
-        # 3.5 Download Maple Mono CN font (CN font with full GBK glyph coverage)
+        # 3.5 Download CEFFontsCJK font (full GBK + full-width forms coverage)
         cd $GITHUB_WORKSPACE/xsystem4/fonts
-        curl -sL https://github.com/subframe7536/maple-font/releases/download/v7.9/MapleMono-CN.zip -o /tmp/maple.zip
-        unzip -o -j /tmp/maple.zip MapleMono-CN-Regular.ttf LICENSE.txt
-        mv LICENSE.txt MapleMono-CN.license
+        curl -sL https://github.com/Partyb0ssishere/cef-fonts-cjk/releases/download/v2.25/CEFFontsCJK-Regular.ttf -o CEFFontsCJK-Regular.ttf
+        curl -sL https://raw.githubusercontent.com/Partyb0ssishere/cef-fonts-cjk/main/LICENSE -o CEFFontsCJK.license
 
-        # 4. Patch text.c to force Maple Mono CN (but keep FNL bitmap fonts working)
+        # 4. Patch text.c to force CEFFontsCJK (but keep FNL bitmap fonts working)
         cd $GITHUB_WORKSPACE/xsystem4
         python3 -c '
         with open("src/text.c", "r") as f:
             c = f.read()
         c = c.replace(
             "#define DEFAULT_FONT_GOTHIC \"fonts/VL-Gothic-Regular.ttf\"",
-            "#define DEFAULT_FONT_GOTHIC \"fonts/MapleMono-CN-Regular.ttf\""
+            "#define DEFAULT_FONT_GOTHIC \"fonts/CEFFontsCJK-Regular.ttf\""
         )
         c = c.replace(
             "#define DEFAULT_FONT_MINCHO \"fonts/HanaMinA.ttf\"",
-            "#define DEFAULT_FONT_MINCHO \"fonts/MapleMono-CN-Regular.ttf\""
+            "#define DEFAULT_FONT_MINCHO \"fonts/CEFFontsCJK-Regular.ttf\""
         )
         target = "static struct font *get_font(unsigned face)\n{\n\tif (face > 255) {\n\t\tface -= 256;\n\t\tif (face >= MAX_FNL_FONTS || !font_fnl[face]) {\n\t\t\tWARNING(\"Invalid fnl face: %u\", face);\n\t\t\treturn font_ttf[0];\n\t\t}\n\t\treturn font_fnl[face];\n\t}\n\tif (face > 1)\n\t\treturn font_ttf[0];\n\treturn font_ttf[face];\n}"
-        replacement = "static struct font *get_font(unsigned face)\n{\n\tif (face > 255) {\n\t\tface -= 256;\n\t\tif (face >= MAX_FNL_FONTS || !font_fnl[face]) {\n\t\t\tWARNING(\"Invalid fnl face: %u\", face);\n\t\t\treturn font_ttf[FONT_MINCHO];\n\t\t}\n\t\treturn font_fnl[face];\n\t}\n\t// CN: force Maple Mono CN for TTF faces (keep FNL bitmap fonts working)\n\treturn font_ttf[FONT_MINCHO];\n}"
+        replacement = "static struct font *get_font(unsigned face)\n{\n\tif (face > 255) {\n\t\tface -= 256;\n\t\tif (face >= MAX_FNL_FONTS || !font_fnl[face]) {\n\t\t\tWARNING(\"Invalid fnl face: %u\", face);\n\t\t\treturn font_ttf[FONT_MINCHO];\n\t\t}\n\t\treturn font_fnl[face];\n\t}\n\t// CN: force CEFFontsCJK for TTF faces (keep FNL bitmap fonts working)\n\treturn font_ttf[FONT_MINCHO];\n}"
         assert target in c, "target in text.c not found"
         c = c.replace(target, replacement, 1)
         with open("src/text.c", "w") as f:
