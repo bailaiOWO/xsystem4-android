@@ -68,6 +68,16 @@ jobs:
         \t}
         \tuint8_t b1 = *src;
         \tuint8_t b2 = *(src + 1);
+        \t// CN fix: SJIS full-width chars (0-9 A-z % / kana) must keep their
+        \t// SJIS meaning; the GBK table would misread them as rare hanzi.
+        \tbool sjis_valid_fb = (b1 >= 0x81 && b1 <= 0x9f) || (b1 >= 0xe0 && b1 <= 0xfc);
+        \tif (sjis_valid_fb && b2 >= 0x40 && b2 <= 0xfc && b2 != 0x7f) {
+        \t\tint sjis_ucs = s2u[b1 - 0x80][b2 - 0x40];
+        \t\tif (sjis_ucs && !(sjis_ucs >= 0x4E00 && sjis_ucs <= 0x9FFF)) {
+        \t\t\t*dst = sjis_ucs;
+        \t\t\treturn (char*)src + 2;
+        \t\t}
+        \t}
         \tif (b1 >= 0x81 && b1 <= 0xfe && b2 >= 0x40 && b2 <= 0xfe && b2 != 0x7f) {
         \t\tint col = b2 - 0x40 - (b2 > 0x7f ? 1 : 0);
         \t\tuint16_t ucs = gbk_to_ucs2[b1 - 0x81][col];
