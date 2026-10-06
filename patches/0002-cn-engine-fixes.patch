@@ -404,7 +404,7 @@ index 6dd563b..13cdd6d 100644
  	ts->font_size = size->font->charmap == CHARMAP_SJIS
  		? sr_get_fallback_size(size) : size;
 diff --git a/src/movie_plmpeg.c b/src/movie_plmpeg.c
-index e90024a..b49e1c3 100644
+index e90024a..b4775c7 100644
 --- a/src/movie_plmpeg.c
 +++ b/src/movie_plmpeg.c
 @@ -38,6 +38,9 @@ static Shader movie_shader;
@@ -417,18 +417,69 @@ index e90024a..b49e1c3 100644
  	SDL_mutex *decoder_mutex;
  
  	plm_frame_t *pending_video_frame;
-@@ -127,10 +130,17 @@ struct movie_context *movie_load(const char *filename)
+@@ -108,6 +111,29 @@ static void update_texture(GLuint unit, GLuint texture, plm_plane_t *plane)
+ 	             GL_RED, GL_UNSIGNED_BYTE, plane->data);
+ }
+ 
++/*
++ * The movies of several AliceSoft games (Rance Quest, Rance IX, ...) are ASF
++ * containers holding WMV1/WMA2 streams, which this build cannot decode (only
++ * MPEG-PS is supported). tools/convert_movies.py transcodes such a movie to
++ * MPEG-PS next to the original (e.g. "Opening.mpg" beside "Opening.alm"), so
++ * look for that substitute before giving up.
++ */
++static char *movie_substitute_path(const char *filename)
++{
++	static const char *exts[] = { "mpg", "mpeg" };
++	const char *dot = strrchr(filename, '.');
++	size_t base_len = dot ? (size_t)(dot - filename) : strlen(filename);
++	for (unsigned i = 0; i < sizeof(exts)/sizeof(*exts); i++) {
++		char buf[PATH_MAX];
++		snprintf(buf, sizeof(buf), "%.*s.%s", (int)base_len, filename, exts[i]);
++		char *path = gamedir_path_icase(buf);
++		if (path && file_exists(path))
++			return path;
++		free(path);
++	}
++	return NULL;
++}
++
+ struct movie_context *movie_load(const char *filename)
+ {
+ 	struct movie_context *mc = xcalloc(1, sizeof(struct movie_context));
+@@ -127,10 +153,38 @@ struct movie_context *movie_load(const char *filename)
  	}
  	mc->plm = plm_create_with_file(fp, TRUE);
  	if (!plm_has_headers(mc->plm)) {
 -		WARNING("%s: not a MPEG-PS file", path);
-+		// Not MPEG-PS - e.g. the ASF/WMV movies of Rance Quest / Rance IX.
-+		// There is no decoder for those in this build, so report an empty
-+		// movie: the game skips the video instead of erroring out.
-+		NOTICE("%s: unsupported movie format (%s), skipping", path,
-+		       file_extension(path) ? file_extension(path) : "?");
++		// plm owns the file (close_when_done), so destroying it closes it too.
 +		plm_destroy(mc->plm);
 +		mc->plm = NULL;
++
++		char *alt = movie_substitute_path(filename);
++		if (alt) {
++			NOTICE("%s: not MPEG-PS, playing converted %s instead",
++			       display_utf0(path), display_utf0(alt));
++			FILE *afp = file_open_utf8(alt, "rb");
++			if (afp) {
++				mc->plm = plm_create_with_file(afp, TRUE);
++				if (plm_has_headers(mc->plm)) {
++					free(path);
++					path = alt;
++					alt = NULL;
++				} else {
++					plm_destroy(mc->plm);
++					mc->plm = NULL;
++				}
++			}
++			free(alt);
++		}
++	}
++	if (!mc->plm) {
++		// Nothing playable: report an empty movie so the game skips the video
++		// instead of erroring out.
++		NOTICE("%s: unsupported movie format (%s), skipping", path,
++		       file_extension(path) ? file_extension(path) : "?");
 +		mc->empty = true;
 +		mc->volume = 100;
  		free(path);
@@ -438,7 +489,7 @@ index e90024a..b49e1c3 100644
  	}
  	free(path);
  
-@@ -170,6 +180,8 @@ void movie_free(struct movie_context *mc)
+@@ -170,6 +224,8 @@ void movie_free(struct movie_context *mc)
  
  bool movie_play(struct movie_context *mc)
  {
@@ -447,7 +498,7 @@ index e90024a..b49e1c3 100644
  	// Start the audio stream.
  	mc->stream_time = 0.0;
  	mc->wall_time_ms = SDL_GetTicks();
-@@ -183,6 +195,8 @@ bool movie_play(struct movie_context *mc)
+@@ -183,6 +239,8 @@ bool movie_play(struct movie_context *mc)
  
  bool movie_draw(struct movie_context *mc, struct sact_sprite *sprite)
  {
@@ -456,7 +507,7 @@ index e90024a..b49e1c3 100644
  	// Decode a frame, unless we already have one.
  	plm_frame_t *frame = mc->pending_video_frame;
  	mc->pending_video_frame = NULL;
-@@ -247,11 +261,15 @@ bool movie_draw(struct movie_context *mc, struct sact_sprite *sprite)
+@@ -247,11 +305,15 @@ bool movie_draw(struct movie_context *mc, struct sact_sprite *sprite)
  
  bool movie_is_end(struct movie_context *mc)
  {
@@ -472,7 +523,7 @@ index e90024a..b49e1c3 100644
  	SDL_LockMutex(mc->timer_mutex);
  	int ms = mc->wall_time_ms ? mc->stream_time * 1000 + SDL_GetTicks() - mc->wall_time_ms : 0;
  	SDL_UnlockMutex(mc->timer_mutex);
-@@ -260,6 +278,8 @@ int movie_get_position(struct movie_context *mc)
+@@ -260,6 +322,8 @@ int movie_get_position(struct movie_context *mc)
  
  bool movie_set_volume(struct movie_context *mc, int volume)
  {

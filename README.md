@@ -18,7 +18,7 @@
 | 兰斯7 战国兰斯（汉化版） | ✅ 可玩 | 中文文本、字体、存档、触控均已适配 |
 | 兰斯8 Rance Quest（汉化版） | ✅ 可玩 | 需本分支的资源包名识别 + TGA 解码支持 |
 | 兰斯6（汉化版） | ✅ 可玩 | |
-| 兰斯9 赫尔曼革命（汉化版） | ⚠️ 部分 | 开场动画为 ASF/WMV 格式，本引擎只有 MPEG-PS 解码器，目前**自动跳过**该动画（不会报错退出）；其余仍在适配 |
+| 兰斯9 赫尔曼革命（汉化版） | ⚠️ 部分 | 游戏本体可玩；开场/结局动画是 ASF(WMV1+WMA2) 格式，本引擎只有 MPEG-1 解码器，**用附带脚本转码后即可正常播放**（见「开场动画」一节） |
 | 其它 System4 游戏 | 见上游 | 日文原版按上游兼容性表；中文版可提 issue |
 
 ## 中文汉化版做了什么
@@ -71,6 +71,31 @@
   菜单里可选 `关闭 / 2x (M) / 4x (M+S)`。**默认档位为 4x**；若遇到画面异常请切到"关闭"。
 - **诊断日志**：为便于继续适配其它作品，引擎会输出少量提示日志（`HLLUSE:` 游戏用到的引擎 API 清单、
   `asset:` 资源包匹配详情、`CG:` 图像加载详情）。用 `adb logcat -s libsys4:V` 查看。
+
+## 开场动画（ASF/WMV 转码）
+
+兰斯8、兰斯9 等作品的动画（`*.alm`）是 **ASF 容器 + WMV1 视频 + WMA2 音频**，
+而本引擎的 Android 构建只带 MPEG-1（MPEG-PS）解码器 —— 这是体积与兼容性的取舍，
+自研 WMV1 解码器并不现实。
+
+解决办法：用附带的脚本把动画转成 MPEG-1/MPEG-PS，**输出在原文件旁边**
+（`Opening.alm` → `Opening.mpg`）。引擎在发现原文件不是 MPEG-PS 时会**自动查找并播放**
+同名的 `.mpg`/`.mpeg`，所以游戏数据不用改动，原动画也保持完好。
+
+```sh
+# PC 上的游戏目录（递归查找所有 .alm/.asf/.wmv）
+python tools/convert_movies.py "/path/to/ランス9/Data/Movie"
+
+# 直接转换设备上的目录（通过 adb 拉取→转换→推回，自动跳过已转换的）
+python tools/convert_movies.py --adb "/storage/emulated/0/Android/data/io.github.kichikuou.xsystem4/files/兰斯9 赫尔曼革命/Data/Movie"
+```
+
+- 需要 `ffmpeg`/`ffprobe`（Windows：`winget install Gyan.FFmpeg`）
+- 默认码率 2500k，可用 `--bitrate 4000k` 提高画质（文件更大）
+- 已经是 MPEG 的文件会被自动跳过；加 `--force` 可强制重转
+- 转码 6 分钟的 720p 动画大约需要几分钟，输出约 120MB
+
+转换后进入游戏即可看到开场动画；若没有转换，动画会被**安静跳过**（不会报错或卡住）。
 
 ## 构建
 
