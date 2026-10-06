@@ -31,6 +31,13 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE/xsystem4/subprojects/libsys4
 
+        # 0. CN encoding fixes: three decoding semantics (display text,
+        #    structured resources, file names) + tolerant file lookup.
+        for p in ../../../patches/libsys4/*.patch; do
+          echo "Applying $p"
+          git apply "$p"
+        done
+
         # 1. Generate static GBK to UCS2 lookup table (bypassing Android bionic iconv limitations)
         python3 -c '
         with open("src/gbk_table.h", "w") as f:
@@ -49,48 +56,35 @@ jobs:
             f.write("};\n")
         '
 
-        # 2. Expand 2-byte boundary
-        sed -i 's/#define SJIS_2BYTE(b) ( ((b) & 0xe0) == 0x80 || ((b) & 0xe0) == 0xe0 )/#define SJIS_2BYTE(b) (((uint8_t)(b) >= 0x81 \&\& (uint8_t)(b) <= 0xfe))/' include/system4/utfsjis.h
-
-        # 3. Patch utfsjis.c to directly use the static GBK lookup table
+        # 2. Generate the reverse table (UCS2 -> GBK), needed to turn file names
+        #    back into the on-disk GBK reading. (The SJIS_2BYTE boundary and the
+        #    utfsjis.c decoders now come from patches/libsys4/0001-cn-encoding.patch.)
         python3 -c '
-        with open("src/utfsjis.c", "r") as f:
-            c = f.read()
-        target = "char *sjis_char2unicode(const char *_src, int *dst)\n{\n\tconst uint8_t *src = (const uint8_t*)_src;"
-        replacement = """#include "gbk_table.h"
-
-        char *sjis_char2unicode(const char *_src, int *dst)
-        {
-        \tconst uint8_t *src = (const uint8_t*)_src;
-        \tif (*src <= 0x7f) {
-        \t\t*dst = *src;
-        \t\treturn (char*)src + 1;
-        \t}
-        \tuint8_t b1 = *src;
-        \tuint8_t b2 = *(src + 1);
-        \t// CN fix: engine emits full-width forms (0-9 A-z % /) as SJIS codes
-        \t// at runtime; GBK table would misread them as rare hanzi (1 -> 侾).
-        \t// SJIS wins ONLY in the U+FF01-FF5E block (corpus-validated).
-        \tbool sjis_valid_fb = (b1 >= 0x81 && b1 <= 0x9f) || (b1 >= 0xe0 && b1 <= 0xfc);
-        \tif (sjis_valid_fb && b2 >= 0x40 && b2 <= 0xfc && b2 != 0x7f) {
-        \t\tint sjis_ucs = s2u[b1 - 0x80][b2 - 0x40];
-        \t\tif (sjis_ucs >= 0xFF01 && sjis_ucs <= 0xFF5E) {
-        \t\t\t*dst = sjis_ucs;
-        \t\t\treturn (char*)src + 2;
-        \t\t}
-        \t}
-        \tif (b1 >= 0x81 && b1 <= 0xfe && b2 >= 0x40 && b2 <= 0xfe && b2 != 0x7f) {
-        \t\tint col = b2 - 0x40 - (b2 > 0x7f ? 1 : 0);
-        \t\tuint16_t ucs = gbk_to_ucs2[b1 - 0x81][col];
-        \t\tif (ucs != 0) {
-        \t\t\t*dst = (int)ucs;
-        \t\t\treturn (char*)src + 2;
-        \t\t}
-        \t}"""
-        assert target in c, "target in utfsjis.c not found"
-        c = c.replace(target, replacement, 1)
-        with open("src/utfsjis.c", "w") as f:
-            f.write(c)
+        import re
+        with open("src/gbk_table.h", "r") as f:
+            text = f.read()
+        m = re.search(r"gbk_to_ucs2\[126\]\[190\] = \{(.*?)\};", text, re.S)
+        rows = re.findall(r"\{([^{}]*)\}", m.group(1))
+        assert len(rows) == 126, "gbk_table.h malformed"
+        rev = {}
+        for b1i, row in enumerate(rows):
+            for b2i, v in enumerate([x.strip() for x in row.split(",") if x.strip()]):
+                ucs = int(v, 0)
+                if ucs == 0:
+                    continue
+                b2 = b2i + 0x40
+                if b2 > 0x7e:
+                    b2 += 1
+                rev.setdefault(ucs, ((b1i + 0x81) << 8) | b2)
+        out = ["/* Auto-generated reverse GBK table (UCS2 -> GBK code). */",
+               "#ifndef GBK_REV_TABLE_H", "#define GBK_REV_TABLE_H", "",
+               "struct ucs2_gbk { uint16_t ucs; uint16_t gbk; };", "",
+               "static const struct ucs2_gbk ucs2_to_gbk[%d] = {" % len(rev)]
+        for ucs in sorted(rev):
+            out.append("\t{0x%04x, 0x%04x}," % (ucs, rev[ucs]))
+        out += ["};", "#define UCS2_TO_GBK_COUNT %d" % len(rev), "", "#endif"]
+        with open("src/gbk_rev_table.h", "w") as f:
+            f.write("\n".join(out) + "\n")
         '
 
         # 3.5 Download CEFFontsCJK font (full GBK + full-width forms coverage)
@@ -138,6 +132,19 @@ jobs:
       run: |
         mkdir -p ~/.android
         echo "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" | base64 -d > ~/.android/debug.keystore
+
+    - name: Populate app assets
+      run: |
+        # The engine loads shaders and fonts from the APK assets. Assets are
+        # gitignored, so they have to be copied from the engine tree here
+        # (the Anime4K shaders come from patches/0003-anime4k.patch, the fonts
+        # from the download step above).
+        cd $GITHUB_WORKSPACE
+        mkdir -p project/app/src/main/assets
+        rm -rf project/app/src/main/assets/shaders project/app/src/main/assets/fonts
+        cp -r xsystem4/shaders project/app/src/main/assets/
+        cp -r xsystem4/fonts project/app/src/main/assets/
+        ls -R project/app/src/main/assets | head -40
 
     - name: App Build
       run: |

@@ -1,20 +1,27 @@
 package io.github.kichikuou.xsystem4
 
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.RippleDrawable
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.View
 import android.view.ViewGroup
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupWindow
@@ -35,6 +42,8 @@ class XSystem4Activity : SDLActivity() {
 
         const val PREFS_NAME = "xsystem4"
         const val PREF_TOUCH_MODE = "touch_mode"
+        const val PREF_ANIME4K = "anime4k"
+        const val PREF_ANIME4K_SCALE = "anime4k_scale"
     }
 
     enum class TouchMode {
@@ -42,11 +51,21 @@ class XSystem4Activity : SDLActivity() {
         DIRECT,     // Touch directly maps to screen position.
     }
 
+    enum class Anime4kScale(val label: String) {
+        OFF("关闭"),
+        X2("2x (M)"),
+        X4("4x (M+S)"),
+    }
+
     private var cursorView: ImageView? = null
     private var cursorBitmapNormal: Bitmap? = null
     private var cursorBitmapDragging: Bitmap? = null
 
     private var touchMode = TouchMode.TOUCHPAD
+    private var anime4kScale = Anime4kScale.X4
+
+    // Implemented in xsystem4/src/anime4k.c (libxsystem4.so)
+    private external fun nativeSetAnime4kMode(mode: Int)
 
     private var cursorX = -1f
     private var cursorY = -1f
@@ -67,24 +86,12 @@ class XSystem4Activity : SDLActivity() {
     private var secondFingerDownX = 0f
     private var secondFingerDownY = 0f
 
-    // Direct mode state
-    private var directRightClickFired = false
-
     private val mainHandler = Handler(Looper.getMainLooper())
     private val longPressRunnable = Runnable {
         if (!hasMoved && maxPointers == 1) {
             isDragging = true
             cursorView?.setImageBitmap(cursorBitmapDragging)
             SDLActivity.onNativeMouse(1, MotionEvent.ACTION_DOWN, cursorX, cursorY, false)
-        }
-    }
-    private val directLongPressRunnable = Runnable {
-        if (!hasMoved && maxPointers == 1) {
-            directRightClickFired = true
-            SDLActivity.onNativeMouse(2, MotionEvent.ACTION_DOWN, cursorX, cursorY, false)
-            cursorView?.postDelayed({
-                SDLActivity.onNativeMouse(0, MotionEvent.ACTION_UP, cursorX, cursorY, false)
-            }, 40L)
         }
     }
 
@@ -100,6 +107,18 @@ class XSystem4Activity : SDLActivity() {
                     .getString(PREF_TOUCH_MODE, TouchMode.TOUCHPAD.name)!!)
         } catch (e: IllegalArgumentException) {
             TouchMode.TOUCHPAD
+        }
+        anime4kScale = try {
+            Anime4kScale.valueOf(
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getString(PREF_ANIME4K_SCALE, Anime4kScale.X4.name)!!)
+        } catch (e: IllegalArgumentException) {
+            Anime4kScale.X4
+        }
+        try {
+            nativeSetAnime4kMode(anime4kScale.ordinal)
+        } catch (e: UnsatisfiedLinkError) {
+            // Library not loaded yet; the menu toggle applies it later.
         }
         initVirtualCursor()
     }
@@ -166,6 +185,12 @@ class XSystem4Activity : SDLActivity() {
     }
 
     private fun updateCursor(x: Float, y: Float) {
+        // In direct mode the finger IS the pointer; no visible cursor.
+        if (touchMode == TouchMode.DIRECT) {
+            cursorView?.visibility = View.INVISIBLE
+            return
+        }
+        cursorView?.visibility = View.VISIBLE
         cursorView?.apply {
             this.x = x
             this.y = y
@@ -366,21 +391,24 @@ class XSystem4Activity : SDLActivity() {
                 touchDownTime = System.currentTimeMillis()
                 maxPointers = 1
                 hasMoved = false
-                directRightClickFired = false
+                isDragging = false
+                twoFingerScrolled = false
                 cursorX = event.x.coerceIn(0f, width)
                 cursorY = event.y.coerceIn(0f, height)
                 updateCursor(cursorX, cursorY)
                 SDLActivity.onNativeMouse(0, MotionEvent.ACTION_HOVER_MOVE, cursorX, cursorY, false)
-                mainHandler.removeCallbacks(directLongPressRunnable)
-                mainHandler.postDelayed(directLongPressRunnable, 550L)
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
-                mainHandler.removeCallbacks(directLongPressRunnable)
                 if (pointerCount > maxPointers) {
                     maxPointers = pointerCount
                 }
                 if (pointerCount == 2) {
                     lastTwoFingerY = (event.getY(0) + event.getY(1)) / 2f
+                    val idx = event.actionIndex
+                    secondFingerId = event.getPointerId(idx)
+                    secondFingerDownTime = System.currentTimeMillis()
+                    secondFingerDownX = event.getX(idx)
+                    secondFingerDownY = event.getY(idx)
                     twoFingerScrolled = false
                 }
             }
@@ -392,15 +420,31 @@ class XSystem4Activity : SDLActivity() {
                     val curX = event.x
                     val curY = event.y
                     val dist = hypot((curX - touchDownX).toDouble(), (curY - touchDownY).toDouble()).toFloat()
-                    if (dist > 14f) {
-                        hasMoved = true
-                        mainHandler.removeCallbacks(directLongPressRunnable)
-                    }
                     cursorX = curX.coerceIn(0f, width)
                     cursorY = curY.coerceIn(0f, height)
+                    if (dist > 14f) {
+                        hasMoved = true
+                        // Moving while pressed = drag (Rance games need this a lot).
+                        if (!isDragging && maxPointers == 1 && !twoFingerScrolled) {
+                            isDragging = true
+                            SDLActivity.onNativeMouse(1, MotionEvent.ACTION_DOWN, cursorX, cursorY, false)
+                        }
+                    }
                     updateCursor(cursorX, cursorY)
-                    SDLActivity.onNativeMouse(0, MotionEvent.ACTION_HOVER_MOVE, cursorX, cursorY, false)
+                    if (isDragging) {
+                        SDLActivity.onNativeMouse(1, MotionEvent.ACTION_MOVE, cursorX, cursorY, false)
+                    } else {
+                        SDLActivity.onNativeMouse(0, MotionEvent.ACTION_HOVER_MOVE, cursorX, cursorY, false)
+                    }
                 } else if (pointerCount == 2) {
+                    // Cursor keeps following the FIRST finger.
+                    cursorX = event.getX(0).coerceIn(0f, width)
+                    cursorY = event.getY(0).coerceIn(0f, height)
+                    updateCursor(cursorX, cursorY)
+                    if (isDragging) {
+                        SDLActivity.onNativeMouse(1, MotionEvent.ACTION_MOVE, cursorX, cursorY, false)
+                    }
+
                     val midY = (event.getY(0) + event.getY(1)) / 2f
                     val dy = midY - lastTwoFingerY
                     if (Math.abs(dy) >= 25f) {
@@ -410,17 +454,51 @@ class XSystem4Activity : SDLActivity() {
                         twoFingerScrolled = true
                         hasMoved = true
                     }
+                    val idx = event.findPointerIndex(secondFingerId)
+                    if (idx >= 0) {
+                        val d2 = hypot(
+                            (event.getX(idx) - secondFingerDownX).toDouble(),
+                            (event.getY(idx) - secondFingerDownY).toDouble()
+                        ).toFloat()
+                        if (d2 > 30f) {
+                            twoFingerScrolled = true
+                        }
+                    }
                 }
             }
             MotionEvent.ACTION_POINTER_UP -> {
-                mainHandler.removeCallbacks(directLongPressRunnable)
+                if (isDragging) {
+                    // The finger holding the drag went away: end the drag.
+                    SDLActivity.onNativeMouse(0, MotionEvent.ACTION_UP, cursorX, cursorY, false)
+                    isDragging = false
+                }
+                if (pointerCount == 2 && secondFingerId >= 0) {
+                    // Hold one finger + tap with another = right click,
+                    // at the first finger's (cursor) position.
+                    val dur = System.currentTimeMillis() - secondFingerDownTime
+                    val idx = event.findPointerIndex(secondFingerId)
+                    val secondFingerMoved = if (idx >= 0) {
+                        hypot(
+                            (event.getX(idx) - secondFingerDownX).toDouble(),
+                            (event.getY(idx) - secondFingerDownY).toDouble()
+                        ).toFloat() > 30f
+                    } else {
+                        false
+                    }
+                    if (!twoFingerScrolled && !secondFingerMoved && dur < 500L) {
+                        sendClick(2)
+                    }
+                    secondFingerId = -1
+                }
             }
             MotionEvent.ACTION_UP -> {
-                mainHandler.removeCallbacks(directLongPressRunnable)
                 val duration = System.currentTimeMillis() - touchDownTime
                 val dist = hypot((event.x - touchDownX).toDouble(), (event.y - touchDownY).toDouble()).toFloat()
 
-                if (maxPointers == 1 && !hasMoved && !directRightClickFired &&
+                if (isDragging) {
+                    SDLActivity.onNativeMouse(0, MotionEvent.ACTION_UP, cursorX, cursorY, false)
+                    isDragging = false
+                } else if (maxPointers == 1 && !hasMoved &&
                     dist < 14f && duration < 320L) {
                     sendClick(1)
                 }
@@ -450,68 +528,131 @@ class XSystem4Activity : SDLActivity() {
             menuPopup?.dismiss()
             return
         }
-        val dp = resources.displayMetrics.density
-        val pad = (14 * dp).toInt()
-        val rowPad = (10 * dp).toInt()
+        val density = resources.displayMetrics.density
+        fun dp(v: Int) = (v * density).toInt()
+        val drawerWidth = dp(320)   // tablet max width (5 x 64dp)
+        val medium = Typeface.create("sans-serif-medium", Typeface.NORMAL)
 
-        val root = LinearLayout(this).apply {
+        // MD1 temporary navigation drawer: full-height panel sliding in from
+        // the left, resting elevation 16dp, with a scrim over the content.
+        val drawer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(0xF01E1E22.toInt())
-            setPadding(pad, pad, pad, pad)
+            setBackgroundColor(Color.WHITE)
+            elevation = dp(16).toFloat()
         }
 
-        fun addHeader(text: String) {
-            root.addView(TextView(this).apply {
+        fun addSubheader(text: String) {
+            drawer.addView(TextView(this).apply {
                 this.text = text
-                textSize = 12f
-                setTextColor(0xFF9E9E9E.toInt())
-                setPadding(rowPad / 2, rowPad / 2, rowPad / 2, rowPad / 2)
+                typeface = medium
+                textSize = 14f
+                setTextColor(0x8A000000.toInt())
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, dp(48)
+                )
+                setPadding(dp(16), 0, dp(16), 0)
             })
         }
 
-        fun addRow(text: String, checked: Boolean = false, onClick: (TextView) -> Unit) {
-            root.addView(TextView(this).apply {
-                this.text = if (checked) "✓ $text" else "　$text"
-                textSize = 16f
-                setTextColor(Color.WHITE)
-                setPadding(rowPad, rowPad / 2, rowPad, rowPad / 2)
-                setOnClickListener { onClick(this) }
+        val ripple = RippleDrawable(
+            ColorStateList.valueOf(0x40000000.toInt()),
+            ColorDrawable(Color.TRANSPARENT),
+            null
+        )
+
+        fun addRow(label: String, checked: Boolean = false, onClick: () -> Unit) {
+            drawer.addView(TextView(this).apply {
+                text = if (checked) "✓ $label" else "  $label"
+                typeface = medium
+                // Selected item switches to 100% black (MD1 drawer selection state).
+                textSize = 14f
+                setTextColor(if (checked) Color.BLACK else 0xDE000000.toInt())
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, dp(48)
+                )
+                setPadding(dp(16), 0, dp(16), 0)
+                background = ripple.constantState?.newDrawable() ?: ripple
+                setOnClickListener { onClick() }
             })
         }
 
-        addHeader("输入方式")
-        addRow("触摸板模式（相对移动）", touchMode == TouchMode.TOUCHPAD) {
+        addSubheader("输入方式")
+        addRow("触摸板模式", touchMode == TouchMode.TOUCHPAD) {
             setTouchMode(TouchMode.TOUCHPAD)
         }
-        addRow("触控模式（直接点按）", touchMode == TouchMode.DIRECT) {
+        addRow("触控模式", touchMode == TouchMode.DIRECT) {
             setTouchMode(TouchMode.DIRECT)
         }
-        addHeader("工具")
+        addSubheader("画面")
+        for (scale in Anime4kScale.values()) {
+            addRow("Anime4K ${scale.label}", anime4kScale == scale) {
+                anime4kScale = scale
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit()
+                    .putString(PREF_ANIME4K_SCALE, scale.name)
+                    .apply()
+                try {
+                    nativeSetAnime4kMode(scale.ordinal)
+                } catch (e: UnsatisfiedLinkError) {
+                }
+                menuPopup?.dismiss()
+                Toast.makeText(
+                    this,
+                    "Anime4K：${scale.label}",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+        addSubheader("工具")
         addRow("修改器（开发中）") {
             Toast.makeText(this, "内置修改器开发中，敬请期待", Toast.LENGTH_SHORT).show()
         }
+        // Full-bleed divider with 8dp padding above and below.
+        drawer.addView(View(this).apply {
+            setBackgroundColor(0x1F000000.toInt())
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(1)
+            ).apply {
+                topMargin = dp(8)
+                bottomMargin = dp(8)
+            }
+        })
         addRow("退出游戏") {
             menuPopup?.dismiss()
             finish()
         }
 
+        // Scrim root: tapping outside the drawer dismisses it.
+        val root = FrameLayout(this).apply {
+            setBackgroundColor(0x99000000.toInt())
+            setOnClickListener { menuPopup?.dismiss() }
+        }
+        root.addView(
+            drawer,
+            FrameLayout.LayoutParams(drawerWidth, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.START)
+        )
+
         val pw = PopupWindow(
             root,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
             true
         )
+        pw.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         pw.isOutsideTouchable = true
         pw.setOnDismissListener { menuPopup = null }
 
         menuPopup = pw
-        pw.showAtLocation(window.decorView, Gravity.TOP or Gravity.END, (10 * dp).toInt(), (60 * dp).toInt())
+        pw.showAtLocation(window.decorView, Gravity.TOP or Gravity.START, 0, 0)
 
-        // Slide in from the right edge.
-        val panelWidth = 260 * dp
-        root.translationX = panelWidth
+        // Slide in from the left over a fading scrim.
+        drawer.translationX = -drawerWidth.toFloat()
+        root.alpha = 0f
         root.post {
-            root.animate().translationX(0f).setDuration(150L).start()
+            drawer.animate().translationX(0f).setDuration(200L).start()
+            root.animate().alpha(1f).setDuration(200L).start()
         }
     }
 
@@ -522,6 +663,7 @@ class XSystem4Activity : SDLActivity() {
             .putString(PREF_TOUCH_MODE, mode.name)
             .apply()
         menuPopup?.dismiss()
+        updateCursor(cursorX, cursorY)
         val name = if (mode == TouchMode.TOUCHPAD) "触摸板模式" else "触控模式"
         Toast.makeText(this, "已切换：$name", Toast.LENGTH_SHORT).show()
     }

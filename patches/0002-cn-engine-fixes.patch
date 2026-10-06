@@ -1,0 +1,527 @@
+diff --git a/src/asset_manager.c b/src/asset_manager.c
+index 1bca82c..04d1a3e 100644
+--- a/src/asset_manager.c
++++ b/src/asset_manager.c
+@@ -77,25 +77,40 @@ struct asset_manager_afa {
+ 	struct afa_archive *archives[MAX_ARCHIVES];
+ };
+ 
++static struct asset_manager_afa *afa_new_manager(void);
++
+ static struct asset_manager *assets[ASSET_TYPE_MAX] = {0};
+ 
+ bool asset_manager_load_archive(enum asset_type type, const char *archive_name)
+ {
++	// Games of the Rance Quest generation load their CG archives themselves
++	// via CGManager.LoadArchive(). The manager is normally created by the
++	// startup scan when it matches "<base>XX.afa", which finds nothing for
++	// CN ports whose base name is mangled - so create it on demand here
++	// instead of failing every request.
+ 	if (!assets[type])
+-		return false;
++		assets[type] = &afa_new_manager()->manager;
+ 	if (!assets[type]->load_archive)
+ 		ERROR("load_archive not supported on this archive type");
+ 	char *path = gamedir_path(archive_name);
+ 	bool r = assets[type]->load_archive(assets[type], path);
++	NOTICE("asset: LoadArchive(%s, \"%s\") -> %s", asset_strtype(type),
++	       display_utf0(archive_name), r ? "ok" : "FAILED");
+ 	free(path);
+ 	return r;
+ }
+ 
+ bool asset_exists(enum asset_type type, int id)
+ {
+-	if (!assets[type])
++	if (!assets[type]) {
++		NOTICE("asset: %s id %d probed but no archive of that type is loaded",
++		       asset_strtype(type), id);
+ 		return false;
+-	return assets[type]->exists_by_id(assets[type], id);
++	}
++	bool r = assets[type]->exists_by_id(assets[type], id);
++	if (!r && type == ASSET_CG)
++		NOTICE("asset: CG id %d does not exist", id);
++	return r;
+ }
+ 
+ bool asset_exists_by_name(enum asset_type type, const char *name, int *id_out)
+@@ -109,9 +124,15 @@ bool asset_exists_by_name(enum asset_type type, const char *name, int *id_out)
+ 
+ struct archive_data *asset_get(enum asset_type type, int id)
+ {
+-	if (!assets[type])
++	if (!assets[type]) {
++		NOTICE("asset: %s id %d requested but no archive of that type is loaded",
++		       asset_strtype(type), id);
+ 		return NULL;
+-	return assets[type]->get_by_id(assets[type], id);
++	}
++	struct archive_data *data = assets[type]->get_by_id(assets[type], id);
++	if (!data)
++		NOTICE("asset: %s id %d NOT FOUND", asset_strtype(type), id);
++	return data;
+ }
+ 
+ struct archive_data *asset_get_by_name(enum asset_type type, const char *name, int *id_out)
+@@ -123,23 +144,61 @@ struct archive_data *asset_get_by_name(enum asset_type type, const char *name, i
+ 	return assets[type]->get_by_name(assets[type], name, id_out);
+ }
+ 
++static void log_decoded_cg(const char *what, struct cg *cg)
++{
++	if (!cg)
++		return;
++	// Diagnostic: is the decoded CG real content or empty/transparent? (A
++	// sprite whose alpha is all zero draws nothing at all.)
++	size_t px = (size_t)cg->metrics.w * cg->metrics.h;
++	if (px > 4096)
++		px = 4096;
++	unsigned sum = 0, alpha0 = 0, alpha255 = 0;
++	if (cg->pixels && cg->metrics.has_pixel) {
++		const uint8_t *p = cg->pixels;
++		for (size_t i = 0; i < px; i++) {
++			sum += p[i * 4] + p[i * 4 + 1] + p[i * 4 + 2];
++			if (p[i * 4 + 3] == 0)
++				alpha0++;
++			else if (p[i * 4 + 3] == 255)
++				alpha255++;
++		}
++	}
++	NOTICE("CG %s: type=%d %dx%d bpp=%d px=%d alpha=%d | rgb_sum=%u a0=%u a255=%u of %u",
++	       what, cg->type, cg->metrics.w, cg->metrics.h, cg->metrics.bpp,
++	       cg->metrics.has_pixel, cg->metrics.has_alpha, sum, alpha0, alpha255,
++	       (unsigned)px);
++}
++
+ struct cg *asset_cg_load(int id)
+ {
+ 	struct archive_data *data = asset_get(ASSET_CG, id);
+-	if (!data)
++	if (!data) {
++		NOTICE("CG: id %d not found (CG archive %s)", id,
++		       assets[ASSET_CG] ? "loaded" : "NOT loaded");
+ 		return NULL;
++	}
+ 	struct cg *cg = cg_load_data(data);
+ 	archive_free_data(data);
++	char what[32];
++	snprintf(what, sizeof(what), "id %d", id);
++	log_decoded_cg(what, cg);
+ 	return cg;
+ }
+ 
+ struct cg *asset_cg_load_by_name(const char *name, int *id_out)
+ {
+ 	struct archive_data *data = asset_get_by_name(ASSET_CG, name, id_out);
+-	if (!data)
++	if (!data) {
++		NOTICE("CG: \"%s\" not found (CG archive %s)", name,
++		       assets[ASSET_CG] ? "loaded" : "NOT loaded");
+ 		return NULL;
++	}
+ 	struct cg *cg = cg_load_data(data);
+ 	archive_free_data(data);
++	char what[80];
++	snprintf(what, sizeof(what), "\"%s\"", name);
++	log_decoded_cg(what, cg);
+ 	return cg;
+ }
+ 
+@@ -175,6 +234,20 @@ static struct archive_data *ald_get_by_id(struct asset_manager *_manager, int id
+ 	return archive_get(manager->archive, id - 1);
+ }
+ 
++static void log_archive_info(const char *path, struct afa_archive *ar)
++{
++	int min_no = -1, max_no = -1;
++	for (unsigned i = 0; i < ar->nr_files; i++) {
++		int no = ar->files[i].no;
++		if (min_no < 0 || no < min_no)
++			min_no = no;
++		if (no > max_no)
++			max_no = no;
++	}
++	NOTICE("asset: opened archive \"%s\": %u files, has_number=%d, no range %d..%d",
++	       display_utf0(path), ar->nr_files, ar->has_number, min_no, max_no);
++}
++
+ static bool afa_load_archive(struct asset_manager *_manager, const char *name)
+ {
+ 	struct asset_manager_afa *manager = (struct asset_manager_afa*)_manager;
+@@ -194,6 +267,9 @@ static bool afa_load_archive(struct asset_manager *_manager, const char *name)
+ 			return false;
+ 		}
+ 	}
++	// Report the entry numbering: games of this generation identify CGs by
++	// number, so the range tells whether a requested id can exist at all.
++	log_archive_info(path, ar);
+ 
+ 	for (int i = MAX_ARCHIVES - 1; i > 0; i--) {
+ 		manager->archives[i] = manager->archives[i-1];
+@@ -285,6 +361,17 @@ static void ald_init(enum asset_type type, char **files, int count)
+ 	}
+ }
+ 
++static struct asset_manager_afa *afa_new_manager(void)
++{
++	struct asset_manager_afa *manager = xcalloc(1, sizeof(struct asset_manager_afa));
++	manager->manager.load_archive = afa_load_archive;
++	manager->manager.exists_by_id = afa_exists_by_id;
++	manager->manager.get_by_id = afa_get_by_id;
++	manager->manager.exists_by_name = afa_exists_by_name;
++	manager->manager.get_by_name = afa_get_by_name;
++	return manager;
++}
++
+ static void afa_init(enum asset_type type, char *file)
+ {
+ 	if (!file)
+@@ -297,12 +384,9 @@ static void afa_init(enum asset_type type, char *file)
+ 	if (!ar)
+ 		ERROR("Failed to open AFA file: %s", archive_strerror(error));
+ 
+-	struct asset_manager_afa *manager = xcalloc(1, sizeof(struct asset_manager_afa));
+-	manager->manager.load_archive = afa_load_archive;
+-	manager->manager.exists_by_id = afa_exists_by_id;
+-	manager->manager.get_by_id = afa_get_by_id;
+-	manager->manager.exists_by_name = afa_exists_by_name;
+-	manager->manager.get_by_name = afa_get_by_name;
++	log_archive_info(file, ar);
++
++	struct asset_manager_afa *manager = afa_new_manager();
+ 	manager->archives[0] = ar;
+ 	assets[type] = &manager->manager;
+ 
+@@ -318,6 +402,20 @@ static char *get_base_name(const char *ain_filename)
+ 	return path;
+ }
+ 
++/*
++ * Same base name, read with the GBK table - i.e. the name as it exists on
++ * disk in the CN ports (the data was extracted on Windows with the GBK
++ * codepage, so "<base>CG.afa" carries the GBK reading of the original bytes).
++ */
++static char *get_base_name_path(const char *ain_filename)
++{
++	char *path = sjis2utf_gbk(ain_filename, 0);
++	char *dot = strrchr(path, '.');
++	if (dot)
++		*dot = '\0';
++	return path;
++}
++
+ void asset_manager_init(void)
+ {
+ 	char *ald_filenames[ASSET_TYPE_MAX][ALD_FILEMAX] = {0};
+@@ -333,23 +431,41 @@ void asset_manager_init(void)
+ 
+ 	char *base = get_base_name(config.ain_filename);
+ 	size_t base_len = strlen(base);
++	char *base_path = get_base_name_path(config.ain_filename);
++	size_t base_path_len = strlen(base_path);
+ 
+ 	// get ALD filenames
+ 	while ((d_name = readdir_utf8(dir))) {
+-		// archive filename must begin with ain filename
+-		if (strncasecmp(base, d_name, base_len))
+-			goto loop_next;
+ 		const char *ext = file_extension(d_name);
+ 		if (!ext)
+ 			goto loop_next;
++		if (!strcasecmp(ext, "fnl")) {
++			// The games' bitmap fonts (FNL) contain Japanese glyphs only, so
++			// a CN port that used them would draw blanks for Chinese text.
++			// Only load the FNL when it matches the *display* base name; for
++			// the mangled names of the CN ports this finds nothing, and the
++			// text is rendered with the TTF font (CEFFontsCJK) instead.
++			if (!config.fnl_path && !strncasecmp(base, d_name, base_len))
++				config.fnl_path = path_join(config.game_dir, d_name);
++			goto loop_next;
++		}
++		// Archive files must match the on-disk (GBK) reading of the base
++		// name; fall back to the display reading.
++		size_t match_len;
++		if (base_path_len && !strncasecmp(base_path, d_name, base_path_len))
++			match_len = base_path_len;
++		else if (!strncasecmp(base, d_name, base_len))
++			match_len = base_len;
++		else
++			goto loop_next;
+ 		if (!strcasecmp(ext, "ald")) {
+-			int dno = toupper(d_name[base_len+1]) - 'A';
++			int dno = toupper(d_name[match_len+1]) - 'A';
+ 			if (dno < 0 || dno >= ALD_FILEMAX) {
+ 				WARNING("Invalid ALD index: %s", display_utf0(d_name));
+ 				goto loop_next;
+ 			}
+ 
+-			switch (d_name[base_len]) {
++			switch (d_name[match_len]) {
+ 			case 'b':
+ 			case 'B':
+ 				ald_filenames[ASSET_BGM][dno] = path_join(config.game_dir, d_name);
+@@ -393,7 +509,7 @@ void asset_manager_init(void)
+ 			}
+ 			config.ex_path = path_join(config.game_dir, d_name);
+ 		} else if (!strcasecmp(ext, "afa")) {
+-			const char *type = d_name + base_len;
++			const char *type = d_name + match_len;
+ 			if (!strcmp(type, "BA.afa")) {
+ 				afa_filenames[ASSET_BGM] = path_join(config.game_dir, d_name);
+ 			} else if (!strcmp(type, "WA.afa") || !strcmp(type, "Sound.afa")) {
+@@ -409,15 +525,22 @@ void asset_manager_init(void)
+ 			} else if (!strcmp(type, "AFF.afa")) {
+ 				afa_filenames[ASSET_FLASH] = path_join(config.game_dir, d_name);
+ 			}
+-		} else if (!strcasecmp(ext, "fnl")) {
+-			if (!config.fnl_path)
+-				config.fnl_path = path_join(config.game_dir, d_name);
+ 		}
+ 	loop_next:
+ 		free(d_name);
+ 	}
+ 	closedir_utf8(dir);
++
++	// Log which resources were actually matched (diagnosing "nothing draws").
++	NOTICE("assets: base=\"%s\" base_path=\"%s\" CG.afa=%s CG.ald=%s DATA.ald=%s FLAT=%s FNL=%s",
++	       base, base_path,
++	       afa_filenames[ASSET_CG] ? afa_filenames[ASSET_CG] : "(none)",
++	       ald_filenames[ASSET_CG][0] ? ald_filenames[ASSET_CG][0] : "(none)",
++	       ald_filenames[ASSET_DATA][0] ? ald_filenames[ASSET_DATA][0] : "(none)",
++	       afa_filenames[ASSET_FLAT] ? afa_filenames[ASSET_FLAT] : "(none)",
++	       config.fnl_path ? config.fnl_path : "(none)");
+ 	free(base);
++	free(base_path);
+ 
+ 	// open ALD archives
+ 	ald_init(ASSET_BGM, ald_filenames[ASSET_BGM], ald_count[ASSET_BGM]);
+diff --git a/src/ffi.c b/src/ffi.c
+index 17aad6c..32e96cc 100644
+--- a/src/ffi.c
++++ b/src/ffi.c
+@@ -292,6 +292,33 @@ static void trace_hll_call(struct ain_library *lib, struct ain_hll_function *f,
+ }
+ #endif /* TRACE_HLL */
+ 
++/*
++ * Log every distinct HLL entry point the game uses, once per run.
++ *
++ * Porting a new game means answering "which engine APIs does it actually
++ * call?" - this gives that list directly (several hundred lines at most),
++ * without the noise of per-call tracing.
++ */
++static void log_hll_usage(struct ain_library *lib, int libno, int fno)
++{
++	static bool **seen;
++	static unsigned *seen_size;
++	if (!seen) {
++		seen = xcalloc(ain->nr_libraries, sizeof(bool*));
++		seen_size = xcalloc(ain->nr_libraries, sizeof(unsigned));
++	}
++	if (!seen[libno] || seen_size[libno] < lib->nr_functions) {
++		unsigned old = seen_size[libno];
++		seen[libno] = xrealloc(seen[libno], lib->nr_functions * sizeof(bool));
++		memset(seen[libno] + old, 0, (lib->nr_functions - old) * sizeof(bool));
++		seen_size[libno] = lib->nr_functions;
++	}
++	if (!seen[libno][fno]) {
++		seen[libno][fno] = true;
++		NOTICE("HLLUSE: %s.%s", lib->name, lib->functions[fno].name);
++	}
++}
++
+ void hll_call(int libno, int fno)
+ {
+ 	struct ain_hll_function *f = &ain->libraries[libno].functions[fno];
+@@ -303,6 +330,8 @@ void hll_call(int libno, int fno)
+ 	if (!fun->fun)
+ 		VM_ERROR("Unimplemented HLL function: %s.%s", ain->libraries[libno].name, f->name);
+ 
++	log_hll_usage(&ain->libraries[libno], libno, fno);
++
+ 	void *args[HLL_MAX_ARGS];
+ 	void *ptrs[HLL_MAX_ARGS];
+ 	// Copy reference arguments to the stack to protect against heap
+diff --git a/src/hacks.c b/src/hacks.c
+index 480605d..b7a5c3e 100644
+--- a/src/hacks.c
++++ b/src/hacks.c
+@@ -290,6 +290,26 @@ static void apply_daibanchou_hacks(struct ain *ain)
+ 	}
+ }
+ 
++/*
++ * Rance Quest identifies CGs by name (string) while the earlier games of the
++ * same engine generation use numeric indices. That signature is what the
++ * ChipmunkSpriteEngine/GoatGUIEngine hooks key off, so it is also the reliable
++ * way to recognise the game: the CN patches rename it in the ini (e.g. the
++ * Chinese Rance Quest has GameName="兰斯8"), which defeats the name check in
++ * apply_game_specific_hacks.
++ */
++static bool is_rance8_by_signature(struct ain *ain)
++{
++	int libno = ain_get_library(ain, "GoatGUIEngine");
++	if (libno < 0)
++		return false;
++	int fno = ain_get_library_function(ain, libno, "SetPartsCG");
++	if (fno < 0)
++		return false;
++	struct ain_hll_function *fun = &ain->libraries[libno].functions[fno];
++	return fun->nr_arguments >= 2 && fun->arguments[1].type.data == AIN_STRING;
++}
++
+ void apply_game_specific_hacks(struct ain *ain)
+ {
+ 	char *game_name = sjis2utf(config.game_name, 0);
+@@ -315,4 +335,9 @@ void apply_game_specific_hacks(struct ain *ain)
+ 	// XXX: we don't rely on game_name because mods change it
+ 	if (ain_get_library(ain, "SengokuRanceFont") >= 0)
+ 		game_rance7_mg = true;
++
++	// Same reasoning for Rance Quest: the CN patches change GameName, so fall
++	// back to the engine API signature (CGs identified by name).
++	if (!game_rance8 && is_rance8_by_signature(ain))
++		game_rance8 = true;
+ }
+diff --git a/src/hll/SengokuRanceFont.c b/src/hll/SengokuRanceFont.c
+index 6dd563b..13cdd6d 100644
+--- a/src/hll/SengokuRanceFont.c
++++ b/src/hll/SengokuRanceFont.c
+@@ -137,6 +137,14 @@ static void sr_prepare_text_style(struct text_style *ts)
+ 	if (ts->font_size)
+ 		return;
+ 	struct font_size *size = gfx_font_get_size(ts->face, ts->size);
++	if (size->font->charmap != CHARMAP_SJIS) {
++		// CN fix: in real System4, small font type indices select FNL bitmap
++		// fonts. Try FNL first so custom glyphs (e.g. stylized digits in the
++		// GBK user-defined area) render correctly.
++		struct font_size *fnl_size = gfx_font_get_size(256 + ts->face, ts->size);
++		if (fnl_size->font->charmap == CHARMAP_SJIS)
++			size = fnl_size;
++	}
+ 	// Install the wrapper only on FNL text styles.
+ 	ts->font_size = size->font->charmap == CHARMAP_SJIS
+ 		? sr_get_fallback_size(size) : size;
+diff --git a/src/movie_plmpeg.c b/src/movie_plmpeg.c
+index e90024a..b49e1c3 100644
+--- a/src/movie_plmpeg.c
++++ b/src/movie_plmpeg.c
+@@ -38,6 +38,9 @@ static Shader movie_shader;
+ 
+ struct movie_context {
+ 	plm_t *plm;
++	// Set when the file is not MPEG-PS (no decoder available): the game then
++	// skips the movie instead of failing to load it.
++	bool empty;
+ 	SDL_mutex *decoder_mutex;
+ 
+ 	plm_frame_t *pending_video_frame;
+@@ -127,10 +130,17 @@ struct movie_context *movie_load(const char *filename)
+ 	}
+ 	mc->plm = plm_create_with_file(fp, TRUE);
+ 	if (!plm_has_headers(mc->plm)) {
+-		WARNING("%s: not a MPEG-PS file", path);
++		// Not MPEG-PS - e.g. the ASF/WMV movies of Rance Quest / Rance IX.
++		// There is no decoder for those in this build, so report an empty
++		// movie: the game skips the video instead of erroring out.
++		NOTICE("%s: unsupported movie format (%s), skipping", path,
++		       file_extension(path) ? file_extension(path) : "?");
++		plm_destroy(mc->plm);
++		mc->plm = NULL;
++		mc->empty = true;
++		mc->volume = 100;
+ 		free(path);
+-		movie_free(mc);
+-		return NULL;
++		return mc;
+ 	}
+ 	free(path);
+ 
+@@ -170,6 +180,8 @@ void movie_free(struct movie_context *mc)
+ 
+ bool movie_play(struct movie_context *mc)
+ {
++	if (mc->empty)
++		return true;
+ 	// Start the audio stream.
+ 	mc->stream_time = 0.0;
+ 	mc->wall_time_ms = SDL_GetTicks();
+@@ -183,6 +195,8 @@ bool movie_play(struct movie_context *mc)
+ 
+ bool movie_draw(struct movie_context *mc, struct sact_sprite *sprite)
+ {
++	if (mc->empty)
++		return true;
+ 	// Decode a frame, unless we already have one.
+ 	plm_frame_t *frame = mc->pending_video_frame;
+ 	mc->pending_video_frame = NULL;
+@@ -247,11 +261,15 @@ bool movie_draw(struct movie_context *mc, struct sact_sprite *sprite)
+ 
+ bool movie_is_end(struct movie_context *mc)
+ {
++	if (mc->empty)
++		return true;
+ 	return plm_has_ended(mc->plm);
+ }
+ 
+ int movie_get_position(struct movie_context *mc)
+ {
++	if (mc->empty)
++		return 0;
+ 	SDL_LockMutex(mc->timer_mutex);
+ 	int ms = mc->wall_time_ms ? mc->stream_time * 1000 + SDL_GetTicks() - mc->wall_time_ms : 0;
+ 	SDL_UnlockMutex(mc->timer_mutex);
+@@ -260,6 +278,8 @@ int movie_get_position(struct movie_context *mc)
+ 
+ bool movie_set_volume(struct movie_context *mc, int volume)
+ {
++	if (mc->empty)
++		return true;
+ 	mc->volume = volume;
+ 	if (mc->voice >= 0)
+ 		mixer_stream_set_volume(mc->voice, volume);
+diff --git a/src/scene.c b/src/scene.c
+index fd8f89c..f10abee 100644
+--- a/src/scene.c
++++ b/src/scene.c
+@@ -81,13 +81,22 @@ void scene_render(void)
+ 		gfx_render_texture(&wp, &r);
+ 	}
+ 
++	// Diagnostic: how many sprites the scene actually contains (a scene with
++	// no sprites at all explains a black screen with only the HUD text).
++	static int frame = 0;
++	int nr = 0;
+ 	struct sprite *sp;
+ 	TAILQ_FOREACH(sp, &sprite_list, entry) {
++		nr++;
+ 		if (sp->render)
+ 			sp->render(sp);
+ 		else
+ 			WARNING("sprite in scene without render function");
+ 	}
++	if (frame < 60 || (frame % 300) == 0) {
++		NOTICE("scene: frame %d: %d sprites, wallpaper=%d", frame, nr, !!wp.handle);
++	}
++	frame++;
+ }
+ 
+ int scene_set_wp(int cg_no) {
+diff --git a/src/util.c b/src/util.c
+index 1cf7ffa..5b90a3b 100644
+--- a/src/util.c
++++ b/src/util.c
+@@ -109,7 +109,11 @@ const char *display_utf2(const char *utf)
+ 
+ char *unix_path(const char *path)
+ {
+-	char *utf = sjis2utf(path, strlen(path));
++	// CN ports: file names on disk are the GBK reading of the original SJIS
++	// bytes (the archives were extracted with the GBK codepage on Windows),
++	// so paths must be decoded with the GBK table, not the mixed display
++	// decoder (which produced names like "婄ＣＧ" instead of "婄俠俧").
++	char *utf = sjis2utf_gbk(path, strlen(path));
+ 	for (int i = 0; utf[i]; i++) {
+ 		if (utf[i] == '\\')
+ 			utf[i] = '/';

@@ -1,0 +1,348 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c0ef5cf..d816417 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -55,6 +55,7 @@ target_sources(sys4 PRIVATE
+   src/savefile.c
+   src/string.c
+   src/system.c
++  src/tga.c
+   src/utfsjis.c
+   src/webp.c
+   src/zlib.c
+diff --git a/include/system4/cg.h b/include/system4/cg.h
+index 75a2000..728c0fe 100644
+--- a/include/system4/cg.h
++++ b/include/system4/cg.h
+@@ -41,6 +41,7 @@ enum cg_type {
+ 	ALCG_JPEG    = 9,
+ 	ALCG_PCF     = 10,
+ 	ALCG_ROU     = 11,
++	ALCG_TGA     = 12,
+ 	_ALCG_NR_FORMATS
+ };
+ 
+diff --git a/include/system4/tga.h b/include/system4/tga.h
+new file mode 100644
+index 0000000..7d2d0af
+--- /dev/null
++++ b/include/system4/tga.h
+@@ -0,0 +1,30 @@
++/* Copyright (C) 2026 xsystem4-android contributors
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://gnu.org/licenses/>.
++ */
++
++#ifndef SYSTEM4_TGA_H
++#define SYSTEM4_TGA_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++
++#include "system4/cg.h"
++
++bool tga_checkfmt(const uint8_t *data);
++void tga_get_metrics(const uint8_t *data, struct cg_metrics *dst);
++void tga_extract(const uint8_t *data, size_t size, struct cg *cg);
++
++#endif /* SYSTEM4_TGA_H */
+diff --git a/meson.build b/meson.build
+index 4161ef7..555a926 100644
+--- a/meson.build
++++ b/meson.build
+@@ -68,6 +68,7 @@ system4 = ['src/aar.c',
+            'src/savefile.c',
+            'src/string.c',
+            'src/system.c',
++           'src/tga.c',
+            'src/utfsjis.c',
+            'src/webp.c',
+            'src/zlib.c',
+diff --git a/src/cg.c b/src/cg.c
+index 6e886be..5833aa9 100644
+--- a/src/cg.c
++++ b/src/cg.c
+@@ -29,6 +29,7 @@
+ #include "system4/png.h"
+ #include "system4/qnt.h"
+ #include "system4/rou.h"
++#include "system4/tga.h"
+ #include "system4/webp.h"
+ 
+ const char *cg_file_extensions[_ALCG_NR_FORMATS] = {
+@@ -43,6 +44,7 @@ const char *cg_file_extensions[_ALCG_NR_FORMATS] = {
+ 	[ALCG_JPEG]    = "jpg",
+ 	[ALCG_PCF]     = "pcf",
+ 	[ALCG_ROU]     = "rou",
++	[ALCG_TGA]     = "tga",
+ };
+ 
+ /*
+@@ -72,6 +74,9 @@ enum cg_type cg_check_format(uint8_t *data)
+ 		return ALCG_PCF;
+ 	} else if (rou_checkfmt(data)) {
+ 		return ALCG_ROU;
++	} else if (tga_checkfmt(data)) {
++		// Last: TGA has no magic number, so this validates the header.
++		return ALCG_TGA;
+ 	}
+ 	return ALCG_UNKNOWN;
+ }
+@@ -107,6 +112,9 @@ bool cg_get_metrics_internal(uint8_t *buf, size_t buf_size, struct cg_metrics *d
+ 	case ALCG_ROU:
+ 		rou_get_metrics(buf, buf_size, dst);
+ 		break;
++	case ALCG_TGA:
++		tga_get_metrics(buf, dst);
++		break;
+ 	default:
+ 		WARNING("Unknown CG type");
+ 		return false;
+@@ -176,9 +184,18 @@ static struct cg *cg_load_internal(uint8_t *buf, size_t buf_size, struct archive
+ 	case ALCG_ROU:
+ 		rou_extract(buf, buf_size, cg);
+ 		break;
+-	default:
+-		WARNING("Unknown CG type");
++	case ALCG_TGA:
++		tga_extract(buf, buf_size, cg);
+ 		break;
++	default: {
++		char hex[3 * 16 + 1];
++		size_t n = buf_size < 16 ? buf_size : 16;
++		for (size_t i = 0; i < n; i++)
++			snprintf(hex + i * 3, 4, "%02x ", buf[i]);
++		hex[n * 3] = '\0';
++		NOTICE("Unknown CG type: size=%zu first bytes: %s", buf_size, hex);
++		break;
++	}
+ 	}
+ 
+ 	if (cg->pixels)
+diff --git a/src/tga.c b/src/tga.c
+new file mode 100644
+index 0000000..61a50d0
+--- /dev/null
++++ b/src/tga.c
+@@ -0,0 +1,209 @@
++/* Copyright (C) 2026 xsystem4-android contributors
++ *
++ * Truevision TGA decoder.
++ *
++ * Rance Quest's CG archives mix QNT and TGA images (the UI elements are TGA),
++ * and TGA is the only one of them without a magic number - it is recognised by
++ * validating the header.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, see <http://gnu.org/licenses/>.
++ */
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "system4.h"
++#include "system4/cg.h"
++#include "system4/tga.h"
++
++#define TGA_HEADER_SIZE 18
++
++enum {
++	TGA_NO_IMAGE      = 0,
++	TGA_CMAP          = 1,
++	TGA_TRUECOLOR     = 2,
++	TGA_GRAYSCALE     = 3,
++	TGA_CMAP_RLE      = 9,
++	TGA_TRUECOLOR_RLE = 10,
++	TGA_GRAYSCALE_RLE = 11,
++};
++
++static int tga_width(const uint8_t *data)
++{
++	return data[12] | data[13] << 8;
++}
++
++static int tga_height(const uint8_t *data)
++{
++	return data[14] | data[15] << 8;
++}
++
++static int tga_pixel_size(uint8_t bpp)
++{
++	return (bpp + 7) / 8;
++}
++
++bool tga_checkfmt(const uint8_t *data)
++{
++	uint8_t image_type = data[2];
++	if (image_type != TGA_TRUECOLOR && image_type != TGA_TRUECOLOR_RLE &&
++	    image_type != TGA_GRAYSCALE && image_type != TGA_GRAYSCALE_RLE)
++		return false;
++	// Colormapped images are not supported below.
++	uint8_t cmap_type = data[1];
++	if (image_type == TGA_GRAYSCALE || image_type == TGA_GRAYSCALE_RLE) {
++		if (cmap_type != 0)
++			return false;
++	}
++	int w = tga_width(data), h = tga_height(data);
++	if (w <= 0 || h <= 0 || w > 16384 || h > 16384)
++		return false;
++	uint8_t bpp = data[16];
++	if (bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32)
++		return false;
++	if (image_type == TGA_GRAYSCALE || image_type == TGA_GRAYSCALE_RLE) {
++		if (bpp != 8)
++			return false;
++	}
++	return true;
++}
++
++void tga_get_metrics(const uint8_t *data, struct cg_metrics *dst)
++{
++	uint8_t bpp = data[16];
++	dst->w = tga_width(data);
++	dst->h = tga_height(data);
++	dst->bpp = bpp;
++	dst->has_pixel = true;
++	dst->has_alpha = bpp == 32 || (data[17] & 0x0f);
++	dst->pixel_pitch = dst->w * tga_pixel_size(bpp);
++	dst->alpha_pitch = 1;
++}
++
++/*
++ * Expand one source pixel (BGR / BGRA / gray) to RGBA.
++ */
++static void tga_store_pixel(uint8_t *dst, const uint8_t *src, int bpp, bool alpha_bits)
++{
++	switch (bpp) {
++	case 8:
++		dst[0] = dst[1] = dst[2] = src[0];
++		dst[3] = 0xFF;
++		break;
++	case 16:
++		// 16bpp TGA is 5-5-5-1 (A1R5G5B5); scale each channel to 8 bits.
++	{
++		uint16_t v = src[0] | src[1] << 8;
++		uint8_t b = (v & 0x1F) << 3, g = (v >> 5 & 0x1F) << 3, r = (v >> 10 & 0x1F) << 3;
++		dst[0] = r | r >> 5;
++		dst[1] = g | g >> 5;
++		dst[2] = b | b >> 5;
++		dst[3] = (v & 0x8000) ? 0xFF : 0x00;
++		break;
++	}
++	case 24:
++		dst[0] = src[2];
++		dst[1] = src[1];
++		dst[2] = src[0];
++		dst[3] = 0xFF;
++		break;
++	default: // 32
++		dst[0] = src[2];
++		dst[1] = src[1];
++		dst[2] = src[0];
++		// With alpha bits declared the 4th byte is real alpha data.
++		dst[3] = alpha_bits ? src[3] : 0xFF;
++		break;
++	}
++}
++
++void tga_extract(const uint8_t *data, size_t size, struct cg *cg)
++{
++	tga_get_metrics(data, &cg->metrics);
++	cg->type = ALCG_TGA;
++
++	int w = cg->metrics.w, h = cg->metrics.h;
++	uint8_t bpp = data[16];
++	uint8_t image_type = data[2];
++	uint8_t descriptor = data[17];
++	bool rle = image_type == TGA_TRUECOLOR_RLE || image_type == TGA_GRAYSCALE_RLE;
++	bool top_down = (descriptor & 0x20) != 0;
++	bool alpha_bits = (descriptor & 0x0f) != 0;
++	int px_size = tga_pixel_size(bpp);
++
++	const uint8_t *src = data + TGA_HEADER_SIZE + data[0];
++	const uint8_t *end = data + size;
++	uint8_t *pixels = xcalloc(1, (size_t)w * h * 4);
++	if (!pixels || src > end) {
++		free(pixels);
++		return;
++	}
++
++	size_t nr_pixels = (size_t)w * h;
++	uint8_t *dst = pixels;
++	if (!rle) {
++		if (src + nr_pixels * px_size > end) {
++			WARNING("TGA: truncated pixel data");
++			free(pixels);
++			return;
++		}
++		for (size_t i = 0; i < nr_pixels; i++, src += px_size, dst += 4)
++			tga_store_pixel(dst, src, bpp, alpha_bits);
++	} else {
++		size_t done = 0;
++		while (done < nr_pixels) {
++			if (src >= end) {
++				WARNING("TGA: truncated RLE stream");
++				break;
++			}
++			uint8_t packet = *src++;
++			size_t count = (packet & 0x7f) + 1;
++			if (done + count > nr_pixels)
++				count = nr_pixels - done;
++			if (packet & 0x80) {
++				// run-length packet: one pixel repeated
++				if (src + px_size > end)
++					break;
++				for (size_t i = 0; i < count; i++, dst += 4)
++					tga_store_pixel(dst, src, bpp, alpha_bits);
++				src += px_size;
++			} else {
++				// raw packet
++				if (src + count * px_size > end)
++					break;
++				for (size_t i = 0; i < count; i++, src += px_size, dst += 4)
++					tga_store_pixel(dst, src, bpp, alpha_bits);
++			}
++			done += count;
++		}
++	}
++
++	// TGA stores rows bottom-up unless the top-down flag is set.
++	if (!top_down) {
++		size_t row = (size_t)w * 4;
++		uint8_t *tmp = xmalloc(row);
++		for (int y = 0; y < h / 2; y++) {
++			uint8_t *a = pixels + (size_t)y * row;
++			uint8_t *b = pixels + (size_t)(h - 1 - y) * row;
++			memcpy(tmp, a, row);
++			memcpy(a, b, row);
++			memcpy(b, tmp, row);
++		}
++		free(tmp);
++	}
++
++	cg->pixels = pixels;
++}

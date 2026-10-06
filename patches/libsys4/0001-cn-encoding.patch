@@ -1,0 +1,483 @@
+diff --git a/include/system4/utfsjis.h b/include/system4/utfsjis.h
+index 10e6924..ca9ac73 100644
+--- a/include/system4/utfsjis.h
++++ b/include/system4/utfsjis.h
+@@ -28,12 +28,17 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ 
+-#define SJIS_2BYTE(b) ( ((b) & 0xe0) == 0x80 || ((b) & 0xe0) == 0xe0 )
++#define SJIS_2BYTE(b) (((uint8_t)(b) >= 0x81 && (uint8_t)(b) <= 0xfe))
+ 
+ extern int   sjis_index(const char *src, int index);
+ extern char *sjis_char2unicode(const char *src, int *dst);
++extern char *sjis_char2unicode_sjis(const char *src, int *dst);
++extern char *sjis_char2unicode_gbk(const char *src, int *dst);
+ extern char* sjis2utf(const char *src, size_t len);
++extern char* sjis2utf_sjis(const char *src, size_t len);
++extern char* sjis2utf_gbk(const char *src, size_t len);
+ extern char* utf2sjis(const char *src, size_t len);
++extern char* utf2gbk(const char *src, size_t len);
+ extern bool  sjis_has_hankaku(const char *src);
+ extern bool  sjis_has_zenkaku(const char *src);
+ extern int   sjis_count_char(const char *src);
+diff --git a/src/file.c b/src/file.c
+index 72cd009..0d59e70 100644
+--- a/src/file.c
++++ b/src/file.c
+@@ -214,11 +214,111 @@ char *path_basename(const char *path)
+ 
+ #else
+ 
++#include <strings.h>
++
+ #define make_dir(path, mode) mkdir(path, mode)
+ 
++/*
++ * CN ports mix codepages inside one directory tree: the data was extracted on
++ * Windows with the GBK codepage (so a folder carries the GBK reading of the
++ * original SJIS bytes, e.g. "婄俠俧" for "顔ＣＧ"), while other entries kept
++ * their Japanese kana ("AliceSoft_02_ガード１.png"). Paths coming from the
++ * game are converted with the GBK reading, so a kana name does not match.
++ *
++ * When an exact lookup fails we retry with the other interpretation of the
++ * same bytes and search the parent directory for a matching entry.
++ */
++static char *alt_name_decoding(const char *utf8)
++{
++	char *gbk = utf2gbk(utf8, 0);
++	char *alt = sjis2utf_sjis(gbk, 0);
++	free(gbk);
++	return alt;
++}
++
++static char *find_dirent_match(const char *dir, const char *name)
++{
++	char *alt = alt_name_decoding(name);
++	DIR *d = opendir(dir && *dir ? dir : ".");
++	if (!d) {
++		free(alt);
++		return NULL;
++	}
++	struct dirent *e;
++	char *found = NULL;
++	while ((e = readdir(d))) {
++		if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
++			continue;
++		if (!strcasecmp(e->d_name, name) ||
++		    (alt && !strcasecmp(e->d_name, alt))) {
++			found = xstrdup(e->d_name);
++			break;
++		}
++	}
++	closedir(d);
++	free(alt);
++	return found;
++}
++
++// Returns an existing path equivalent to `path`, or NULL if none exists.
++static char *resolve_existing_path(const char *path)
++{
++	ustat st;
++	if (stat(path, &st) == 0)
++		return xstrdup(path);
++
++	char *alt = alt_name_decoding(path);
++	if (alt && stat(alt, &st) == 0)
++		return alt;
++	free(alt);
++
++	char *work = xstrdup(path);
++	char *out = xmalloc(PATH_MAX);
++	out[0] = '\0';
++	if (path[0] == '/')
++		strcpy(out, "/");
++
++	char *saveptr = NULL;
++	for (char *comp = strtok_r(work, "/", &saveptr); comp;
++	     comp = strtok_r(NULL, "/", &saveptr)) {
++		char cand[PATH_MAX];
++		size_t len = strlen(out);
++		snprintf(cand, sizeof(cand), "%s%s%s", out,
++		         (len && out[len - 1] != '/') ? "/" : "", comp);
++		if (stat(cand, &st) != 0) {
++			char *match = find_dirent_match(*out ? out : ".", comp);
++			if (!match) {
++				free(work);
++				free(out);
++				return NULL;
++			}
++			len = strlen(out);
++			snprintf(cand, sizeof(cand), "%s%s%s", out,
++			         (len && out[len - 1] != '/') ? "/" : "", match);
++			free(match);
++			if (stat(cand, &st) != 0) {
++				free(work);
++				free(out);
++				return NULL;
++			}
++		}
++		snprintf(out, PATH_MAX, "%s", cand);
++	}
++	free(work);
++	return out;
++}
++
+ UDIR *opendir_utf8(const char *path)
+ {
+-	return opendir(path);
++	UDIR *d = opendir(path);
++	if (d || errno != ENOENT)
++		return d;
++	char *resolved = resolve_existing_path(path);
++	if (!resolved)
++		return NULL;
++	d = opendir(resolved);
++	free(resolved);
++	return d;
+ }
+ 
+ int closedir_utf8(UDIR *dir)
+@@ -236,7 +336,15 @@ char *readdir_utf8(UDIR *dir)
+ 
+ int stat_utf8(const char *path, ustat *st)
+ {
+-	return stat(path, st);
++	int r = stat(path, st);
++	if (r == 0 || errno != ENOENT)
++		return r;
++	char *resolved = resolve_existing_path(path);
++	if (!resolved)
++		return r;
++	r = stat(resolved, st);
++	free(resolved);
++	return r;
+ }
+ 
+ char *realpath_utf8(const char *upath)
+@@ -256,7 +364,16 @@ int rmdir_utf8(const char *path)
+ 
+ FILE *file_open_utf8(const char *path, const char *mode)
+ {
+-	return fopen(path, mode);
++	FILE *fp = fopen(path, mode);
++	if (fp || errno != ENOENT || mode[0] != 'r')
++		return fp;
++	// Reading a file whose name was decoded with the other codepage.
++	char *resolved = resolve_existing_path(path);
++	if (!resolved)
++		return NULL;
++	fp = fopen(resolved, mode);
++	free(resolved);
++	return fp;
+ }
+ 
+ char *path_dirname(const char *path)
+diff --git a/src/utfsjis.c b/src/utfsjis.c
+index 6a312dc..fbfb099 100644
+--- a/src/utfsjis.c
++++ b/src/utfsjis.c
+@@ -47,6 +47,9 @@ int sjis_index(const char *_src, int index)
+ 
+ #include "system4.h"
+ 
++#include "gbk_table.h"
++#include "gbk_rev_table.h"
++
+ char *sjis_char2unicode(const char *_src, int *dst)
+ {
+ 	const uint8_t *src = (const uint8_t*)_src;
+@@ -54,6 +57,34 @@ char *sjis_char2unicode(const char *_src, int *dst)
+ 		*dst = *src;
+ 		return (char*)src + 1;
+ 	}
++	uint8_t b1 = *src;
++	uint8_t b2 = *(src + 1);
++	// CN fix: the game engine emits full-width forms (０-９ Ａ-ｚ ％ ／) as SJIS
++	// codes at runtime; the GBK table would misread them as rare hanzi
++	// (0x8250 -> 侾). SJIS wins ONLY inside the U+FF01-FF5E full-width block:
++	// a scan of all 95223 game messages found exactly 1 real collision with
++	// this rule (値 -> ｎ); broader rules hijack real hanzi (e.g. 铠 -> ⅹ)
++	// or the 0x30FB "invalid" filler positions.
++	bool sjis_valid_fb = (b1 >= 0x81 && b1 <= 0x9f) || (b1 >= 0xe0 && b1 <= 0xfc);
++	if (sjis_valid_fb && b2 >= 0x40 && b2 <= 0xfc && b2 != 0x7f) {
++		int sjis_ucs = s2u[b1 - 0x80][b2 - 0x40];
++		if (sjis_ucs >= 0xFF01 && sjis_ucs <= 0xFF5E) {
++			*dst = sjis_ucs;
++			return (char*)src + 2;
++		}
++	}
++	if (b1 >= 0x81 && b1 <= 0xfe && b2 >= 0x40 && b2 <= 0xfe && b2 != 0x7f) {
++		int col = b2 - 0x40 - (b2 > 0x7f ? 1 : 0);
++		uint16_t ucs = gbk_to_ucs2[b1 - 0x81][col];
++		if (ucs != 0) {
++			*dst = (int)ucs;
++			return (char*)src + 2;
++		}
++	}
++	if (*src <= 0x7f) {
++		*dst = *src;
++		return (char*)src + 1;
++	}
+ 
+ 	if (*src >= 0xa0 && *src <= 0xdf) {
+ 		*dst = 0xff60 + *src - 0xa0;
+@@ -71,7 +102,138 @@ char *sjis_char2unicode(const char *_src, int *dst)
+ 	return (char*)src + 2;
+ }
+ 
+-char *sjis2utf(const char *_src, size_t len) {
++/*
++ * Decode one character as genuine Shift-JIS (original behavior).
++ *
++ * Used for structured Japanese resources (MonsterInfo.txt, .s3de, .pms ...)
++ * whose parsers match Japanese keywords - reading them through the GBK table
++ * turns kana into rare hanzi and makes the parsers fail.
++ */
++char *sjis_char2unicode_sjis(const char *_src, int *dst)
++{
++	const uint8_t *src = (const uint8_t*)_src;
++	if (*src <= 0x7f) {
++		*dst = *src;
++		return (char*)src + 1;
++	}
++	if (*src >= 0xa0 && *src <= 0xdf) {
++		*dst = 0xff60 + *src - 0xa0;
++		return (char*)src + 1;
++	}
++
++	// guard against invalid byte sequence
++	int c = *(src+1);
++	if (c < 0x40 || c == 0x7f || c > 0xfc) {
++		*dst = '?';
++		return (char*)src + 1;
++	}
++
++	*dst = s2u[*src - 0x80][*(src+1) - 0x40];
++	return (char*)src + 2;
++}
++
++/*
++ * Decode one character with the GBK table only (SJIS as fallback).
++ *
++ * Used for file names: the CN Android ports are installed from archives that
++ * Windows extracted with the GBK codepage, so the name on disk is the GBK
++ * reading of the original SJIS bytes. Using the mixed display decoder here
++ * produced names like "婄ＣＧ" that do not exist on disk ("婄俠俧").
++ */
++char *sjis_char2unicode_gbk(const char *_src, int *dst)
++{
++	const uint8_t *src = (const uint8_t*)_src;
++	if (*src <= 0x7f) {
++		*dst = *src;
++		return (char*)src + 1;
++	}
++	uint8_t b1 = *src;
++	uint8_t b2 = *(src + 1);
++	if (b1 >= 0x81 && b1 <= 0xfe && b2 >= 0x40 && b2 <= 0xfe && b2 != 0x7f) {
++		int col = b2 - 0x40 - (b2 > 0x7f ? 1 : 0);
++		uint16_t ucs = gbk_to_ucs2[b1 - 0x81][col];
++		if (ucs != 0) {
++			*dst = (int)ucs;
++			return (char*)src + 2;
++		}
++	}
++	return sjis_char2unicode_sjis(_src, dst);
++}
++
++/*
++ * Lazy set of "kana read through the GBK table" characters.
++ *
++ * Shift-JIS kana bytes decoded as GBK become a specific set of rare hanzi
++ * (モンスター -> 儌儞僗僞乕). Real Chinese text contains essentially none of
++ * them, so their share in a string tells us whether it is really Shift-JIS.
++ */
++static bool kana_mojibake_ready = false;
++static uint8_t kana_mojibake[0x10000 / 8];
++
++static void kana_mojibake_init(void)
++{
++	if (kana_mojibake_ready)
++		return;
++	kana_mojibake_ready = true;
++	for (int b1 = 0x81; b1 <= 0x83; b1++) {
++		for (int b2 = 0x40; b2 <= 0xfe; b2++) {
++			if (b2 == 0x7f)
++				continue;
++			int sjis_ucs = s2u[b1 - 0x80][b2 - 0x40];
++			// Only the SJIS kana block can produce kana mojibake.
++			if (sjis_ucs < 0x3040 || sjis_ucs > 0x30ff)
++				continue;
++			int col = b2 - 0x40 - (b2 > 0x7f ? 1 : 0);
++			if (col < 0 || col >= 190)
++				continue;
++			uint16_t ucs = gbk_to_ucs2[b1 - 0x81][col];
++			if (ucs)
++				kana_mojibake[ucs >> 3] |= 1 << (ucs & 7);
++		}
++	}
++}
++
++static bool is_kana_mojibake(int ucs)
++{
++	return ucs > 0 && ucs < 0x10000 && (kana_mojibake[ucs >> 3] & (1 << (ucs & 7)));
++}
++
++/*
++ * Decide whether a byte string is genuine Shift-JIS Japanese rather than GBK
++ * Chinese. A quarter of the double byte characters being kana-mojibake is a
++ * very strong signal (Japanese dialogue is full of kana; Chinese text of the
++ * CN ports has none).
++ */
++static bool sjis_string_is_japanese(const char *_src)
++{
++	kana_mojibake_init();
++	const uint8_t *src = (const uint8_t*)_src;
++	int total = 0, kana = 0;
++	while (*src) {
++		if (*src <= 0x7f) {
++			src++;
++			continue;
++		}
++		uint8_t b1 = *src, b2 = *(src + 1);
++		if (!b2)
++			break;
++		if (b1 >= 0x81 && b1 <= 0xfe && b2 >= 0x40 && b2 <= 0xfe && b2 != 0x7f) {
++			int col = b2 - 0x40 - (b2 > 0x7f ? 1 : 0);
++			uint16_t ucs = gbk_to_ucs2[b1 - 0x81][col];
++			total++;
++			if (ucs && is_kana_mojibake(ucs))
++				kana++;
++			src += 2;
++		} else {
++			src++;
++		}
++	}
++	return total >= 2 && kana * 4 >= total;
++}
++
++static char *sjis2utf_conv(const char *_src, size_t len,
++                           char *(*charfn)(const char*, int*))
++{
+ 	if (!len)
+ 		len = strlen(_src);
+ 	const uint8_t *src = (uint8_t*)_src;
+@@ -80,7 +242,7 @@ char *sjis2utf(const char *_src, size_t len) {
+ 
+ 	while (*src) {
+ 		int c;
+-		src = (uint8_t*)sjis_char2unicode((const char*)src, &c);
++		src = (uint8_t*)charfn((const char*)src, &c);
+ 
+ 		if (c <= 0x7f) {
+ 			*dstp++ = c;
+@@ -97,6 +259,27 @@ char *sjis2utf(const char *_src, size_t len) {
+ 	return (char*)dst;
+ }
+ 
++/*
++ * General conversion (display text and structured resources). Strings that
++ * are actually Shift-JIS are decoded as such; everything else (the GBK data
++ * of the Chinese ports) uses the hybrid decoder above.
++ */
++char *sjis2utf(const char *_src, size_t len) {
++	if (sjis_string_is_japanese(_src))
++		return sjis2utf_conv(_src, len, sjis_char2unicode_sjis);
++	return sjis2utf_conv(_src, len, sjis_char2unicode);
++}
++
++/* Force genuine Shift-JIS decoding. */
++char *sjis2utf_sjis(const char *_src, size_t len) {
++	return sjis2utf_conv(_src, len, sjis_char2unicode_sjis);
++}
++
++/* Force GBK decoding (file names; matches the on-disk GBK reading). */
++char *sjis2utf_gbk(const char *_src, size_t len) {
++	return sjis2utf_conv(_src, len, sjis_char2unicode_gbk);
++}
++
+ static int unicode_to_sjis(int u) {
+ 	for (int b1 = 0x81; b1 <= 0xff; b1++) {
+ 		if (b1 >= 0xa0 && b1 <= 0xdf)
+@@ -109,6 +292,21 @@ static int unicode_to_sjis(int u) {
+ 	return 0;
+ }
+ 
++/* Binary search the reverse GBK table (sorted by UCS). */
++static int unicode_to_gbk(int u) {
++	int lo = 0, hi = UCS2_TO_GBK_COUNT - 1;
++	while (lo <= hi) {
++		int mid = (lo + hi) / 2;
++		if (ucs2_to_gbk[mid].ucs == u)
++			return ucs2_to_gbk[mid].gbk;
++		if (ucs2_to_gbk[mid].ucs < u)
++			lo = mid + 1;
++		else
++			hi = mid - 1;
++	}
++	return 0;
++}
++
+ char *utf2sjis(const char *_src, size_t len) {
+ 	if (!len)
+ 		len = strlen(_src);
+@@ -139,6 +337,11 @@ char *utf2sjis(const char *_src, size_t len) {
+ 			*dstp++ = u - 0xff60 + 0xa0;
+ 		} else {
+ 			int c = unicode_to_sjis(u);
++			if (!c)
++				// CN fix: hanzi not in SJIS may exist in GBK (e.g. 汉 in
++				// 汉化版 file names). Emit the GBK double-byte code so
++				// file lookups match the on-disk names.
++				c = unicode_to_gbk(u);
+ 			if (c) {
+ 				*dstp++ = c >> 8;
+ 				*dstp++ = c & 0xff;
+@@ -151,6 +354,47 @@ char *utf2sjis(const char *_src, size_t len) {
+ 	return (char*)dst;
+ }
+ 
++/* UTF-8 -> GBK bytes (SJIS as fallback). Inverse of sjis2utf_gbk(). */
++char *utf2gbk(const char *_src, size_t len) {
++	if (!len)
++		len = strlen(_src);
++	const uint8_t *src = (uint8_t*)_src;
++	uint8_t* dst = malloc(len * 2 + 1);
++	uint8_t* dstp = dst;
++
++	while (*src) {
++		if (*src <= 0x7f) {
++			*dstp++ = *src++;
++			continue;
++		}
++
++		int u;
++		if (*src <= 0xdf) {
++			u = (src[0] & 0x1f) << 6 | (src[1] & 0x3f);
++			src += 2;
++		} else if (*src <= 0xef) {
++			u = (src[0] & 0xf) << 12 | (src[1] & 0x3f) << 6 | (src[2] & 0x3f);
++			src += 3;
++		} else {
++			*dstp++ = '?';
++			do src++; while ((*src & 0xc0) == 0x80);
++			continue;
++		}
++
++		int c = unicode_to_gbk(u);
++		if (!c)
++			c = unicode_to_sjis(u);
++		if (c) {
++			*dstp++ = c >> 8;
++			*dstp++ = c & 0xff;
++		} else {
++			*dstp++ = '?';
++		}
++	}
++	*dstp = '\0';
++	return (char*)dst;
++}
++
+ /* src 内に半角カナもしくはASCII文字があるかどうか */
+ bool sjis_has_hankaku(const char *_src) {
+ 	const uint8_t *src = (uint8_t*)_src;
