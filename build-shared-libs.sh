@@ -12,9 +12,9 @@ ANDROID_API_LEVEL=${ANDROID_API_LEVEL:-21}
 
 # Movie playback: cross-compile a minimal ffmpeg per ABI so that the ASF/WMV
 # movies of several games (Rance Quest, Rance IX, ...) play out of the box.
-# The engine's CMake picks it up automatically from <repo>/ffmpeg/<abi>; if the
-# build is skipped or fails, it falls back to the bundled pl_mpeg decoder
-# (MPEG-PS only) instead of breaking the build.
+# The engine's CMake picks it up automatically from <repo>/ffmpeg/<abi>.
+# FFmpeg build/verification failures stop this script. SKIP_FFMPEG=1 explicitly
+# skips that build; without installed FFmpeg libraries CMake selects pl_mpeg.
 FFMPEG_PREFIX=${FFMPEG_PREFIX:-${PWD}/ffmpeg}
 if [ "${SKIP_FFMPEG:-0}" != "1" ]; then
     echo "=== Building ffmpeg (movie playback) ==="

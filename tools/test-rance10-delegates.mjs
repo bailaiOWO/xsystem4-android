@@ -4,7 +4,9 @@
 // Rance 10's base camp quest choice was lost when a per-frame delegate's
 // stale entry kept releasing the closure that RunIScene's postEvent needed,
 // so GetResult never ran and the quest was skipped. Runs the real heap.c
-// allocator (LIFO slot reuse, sequence numbers) and page.c delegate code.
+// allocator (LIFO slot reuse, sequence numbers), cached page allocation, and
+// resume.c JSON save/load with the production cJSON implementation. JSON trees
+// stay in memory; the heap is actually destroyed and restored before dispatch.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';import path from 'node:path';import {spawnSync} from 'node:child_process';import {fileURLToPath} from 'node:url';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),build=path.join(root,'build/rance10-tests');
@@ -15,13 +17,11 @@ function fn(src,name){
   let end=src.indexOf('{',m.index),d=0;do{d+=(src[end]==='{')-(src[end]==='}');end++;}while(d);return src.slice(m.index,end);
 }
 const heapc=read('src/heap.c'),pagec=read('src/page.c'),vmc=read('src/vm.c'),ainh=read('subprojects/libsys4/include/system4/ain.h');
+const resumec=read('src/resume.c'),jsonc=read('src/cJSON.c'),jsonh=read('include/cJSON.h');
 function macro(name){
   const lines=ainh.split('\n'),start=lines.findIndex(l=>l.startsWith(`#define ${name}\t`)||l.startsWith(`#define ${name} `));
   assert.ok(start>=0,name);let end=start;while(lines[end].endsWith('\\'))end++;return lines.slice(start,end+1).join('\n');
 }
-// Every v12 call prunes the live list before iterating its snapshot.
-assert.match(vmc,/struct page \*live = heap_get_delegate_page\(dg_page\);\s*delegate_prune\(live\);\s*struct page \*snapshot = copy_page\(live\);/,'DG_CALLBEGIN');
-
 const source=String.raw`
 typedef int int32_t;typedef unsigned int uint32_t;typedef unsigned long size_t;typedef _Bool bool;
 #define true 1
@@ -44,16 +44,31 @@ enum vm_pointer_type{VM_PAGE,VM_STRING};
 struct page{enum page_type type;union{int index;enum ain_data_type a_type;};
  union{struct{int struct_ptr;int parent_page;uint32_t struct_seq;uint32_t parent_seq;}local;struct{int struct_type;int rank;}array;struct{int live_slot;uint32_t live_seq;}delegate;};
  int nr_vars;union vm_value values[];};
-struct string;
+struct string{char *text;};
 struct vm_pointer{int ref;uint32_t seq;enum vm_pointer_type type;union{struct string *s;struct page *page;};};
 struct vm_pointer *heap;size_t heap_size;uint32_t heap_next_seq;int32_t *heap_free_stack;size_t heap_free_ptr;
-static unsigned char arena[1<<18];static size_t arena_top;
+static unsigned char arena[1<<21];static size_t arena_top;
 void *memset(void *d,int c,size_t n){unsigned char *a=d;for(size_t i=0;i<n;i++)a[i]=c;return d;}
 void *memcpy(void *d,const void *s,size_t n){unsigned char *a=d;const unsigned char *b=s;for(size_t i=0;i<n;i++)a[i]=b[i];return d;}
 static void *xmalloc(size_t n){unsigned char *p=arena+arena_top;arena_top+=16+((n+15)&~15u);if(arena_top>sizeof(arena))__builtin_trap();*(size_t*)p=n;return p+16;}
 static void *xcalloc(size_t a,size_t b){return memset(xmalloc(a*b),0,a*b);}
 static void *xrealloc(void *o,size_t n){void *p=xmalloc(n);if(o){size_t m=*(size_t*)((unsigned char*)o-16);memcpy(p,o,m<n?m:n);}return p;}
 static void free(void *p){(void)p;}
+static size_t strlen(const char *s){size_t n=0;while(s[n])n++;return n;}
+static int strcmp(const char *a,const char *b){while(*a&&*a==*b){a++;b++;}return (unsigned char)*a-(unsigned char)*b;}
+static int tolower(int c){return c>='A'&&c<='Z'?c+'a'-'A':c;}
+/* Unused text-format libc calls are discarded by the linker. The JSON tree
+   API below is the entire production implementation, not a JSON test double. */
+int sprintf(char *,const char *,...);int sscanf(const char *,const char *,...);
+double strtod(const char *,char **);char *strcpy(char *,const char *);int strncmp(const char *,const char *,size_t);
+#define INT_MAX 2147483647
+#define INT_MIN (-INT_MAX-1)
+#define malloc xmalloc
+#define realloc xrealloc
+${jsonh.replace(/^#include[^\n]*$/gm,'')}
+${jsonc.replace(/^#include[^\n]*$/gm,'')}
+#undef malloc
+#undef realloc
 struct ain_type{int data,struc,rank;};
 struct ain_variable{struct ain_type type;};
 struct ain_function{struct ain_variable *vars;};
@@ -61,11 +76,13 @@ struct ain_struct{struct ain_variable *members;int destructor;};
 static struct ain_variable one_int[1]={{{AIN_INT,-1,0}}};
 static struct ain_function functions[2]={{0},{one_int}};
 static struct ain_struct structures[1]={{one_int,0}};
-static struct{struct ain_variable *globals;struct ain_function *functions;struct ain_struct *structures;}the_ain={one_int,functions,structures};
+static struct{struct ain_variable *globals;struct ain_function *functions;struct ain_struct *structures;int nr_delegates;}the_ain={one_int,functions,structures,1};
 #define ain (&the_ain)
-static int pages_freed;
-struct page *alloc_page(enum page_type type,int index,int nr){struct page *p=xcalloc(1,sizeof(*p)+nr*sizeof(union vm_value));p->type=type;p->index=index;p->nr_vars=nr;return p;}
-void free_page(struct page *p){(void)p;pages_freed++;}
+#define NR_CACHES 8
+#define CACHE_SIZE 64
+${pagec.match(/struct page_cache\s*\{[\s\S]*?\};/)[0]}
+struct page_cache page_cache[NR_CACHES];
+${['_alloc_page','alloc_page','free_page'].map(n=>fn(pagec,n)).join('\n')}
 void delete_struct(int no,int slot){(void)no;(void)slot;}
 void free_string(struct string *s){(void)s;__builtin_trap();}
 void exit_unref(int slot){(void)slot;__builtin_trap();}
@@ -81,6 +98,33 @@ ${fn(vmc,'vm_copy')}
 ${['variable_fini','array_type','delegate_is_closure','variable_type','delete_page_vars','delete_page','copy_page',
    'delegate_new_from_method','delegate_contains','delegate_append','delegate_numof','delegate_entry_current','delegate_entry_live',
    'delegate_remove_entry','delegate_erase','delegate_prune','delegate_clear','delegate_get'].map(n=>fn(pagec,n)).join('\n')}
+/* Real resume serialization/deserialization, with only file transport and
+   unrelated bytecode/config migration services replaced at their boundaries. */
+#define possibly_unused
+#define _invalid_save_data(...) VM_ERROR()
+#define invalid_save_data(...) VM_ERROR()
+#define type_check(type,json) _type_check(__FILE__,__func__,__LINE__,type,json)
+${resumec.match(/static const char \* const page_type_strtab\[\]\s*=\s*\{[\s\S]*?\};/)[0]}
+static void savedata_repair_legacy_config(struct page *p){(void)p;}
+static void repair_legacy_array_types(void){}
+static struct string *make_string(const char *s,size_t n){(void)s;(void)n;__builtin_trap();}
+struct function_call{int fno;uint32_t call_address,return_address;int page_slot,struct_page;};
+static struct function_call call_stack[8];static int call_stack_ptr;
+static union vm_value stack[32];static int stack_ptr;static size_t instr_ptr;
+static union vm_value vm_int(int i){return (union vm_value){.i=i};}
+static void stack_push_value(union vm_value v){stack[stack_ptr++]=v;}
+static union vm_value stack_pop(void){return stack[--stack_ptr];}
+static int resume_instruction_width(size_t address){(void)address;return 6;}
+static cJSON *saved_image;
+static cJSON *read_json_image(const char *key,const char *path){(void)key;(void)path;return saved_image;}
+${['string_to_page_type','get_number','value_to_json','resume_page_to_json','heap_item_to_json','heap_to_json',
+   'funcall_to_json','call_stack_to_json','stack_to_json','vm_image_to_json','json_strtype','_type_check',
+   'load_json_page','load_json_string','delete_heap','alloc_heap_slot','load_json_heap',
+   'load_json_call_stack','load_json_stack','load_json_image'].map(n=>fn(resumec,n)).join('\n')}
+static void save_and_restore(void){
+ stack_push_value(vm_int(0));stack_push_value(vm_int(0)); /* ResumeSave arguments */
+ saved_image=vm_image_to_json("delegate-test");load_json_image("delegate-test","memory");saved_image=NULL;
+}
 #define CHECK(c) do{if(!(c))return __LINE__;}while(0)
 static int new_object(void){int s=heap_alloc_slot(VM_PAGE);heap_set_page(s,alloc_page(STRUCT_PAGE,0,1));return s;}
 /* DG_NEW_FROM_METHOD for a lambda with captures: the entry owns the environment. */
@@ -95,6 +139,74 @@ static int call_all(int dg,int *obj,int *fun){
  int inv=heap_alloc_page(snapshot),n=0;
  while(delegate_get(heap_get_delegate_page(inv),n,obj,fun))n++;
  heap_unref(inv);return n;}
+static int test_resume_snapshot(uint32_t first_seq){
+ delete_heap();heap_init();heap_next_seq=first_seq;
+ heap[0].ref=1;heap[0].type=VM_PAGE;heap[0].page=alloc_page(GLOBAL_PAGE,0,1);
+ int o,f,a=new_object(),b=new_object(),c=new_object();
+ int live=heap_alloc_page(delegate_new_from_method(a,41));
+ heap_set_page(live,delegate_append(heap_get_delegate_page(live),b,42));
+ heap_set_page(live,delegate_append(heap_get_delegate_page(live),c,43));
+ struct page *snapshot=copy_page(heap_get_delegate_page(live));
+ CHECK(snapshot->delegate.live_slot==-1&&snapshot->delegate.live_seq==0);
+ snapshot->index=-1;snapshot->delegate.live_slot=live;snapshot->delegate.live_seq=heap_get_seq(live);
+ struct page *copied=copy_page(snapshot);
+ CHECK(copied->index==-1&&copied->delegate.live_slot==live&&copied->delegate.live_seq==heap_get_seq(live));
+ free_page(copied);
+ int invocation=heap_alloc_page(snapshot);
+ CHECK(delegate_get(snapshot,0,&o,&f)&&o==a&&f==41);
+ delegate_erase(heap_get_delegate_page(live),b,42); /* cancelled before saving */
+ uint32_t live_seq=heap_get_seq(live),target_seq=heap_get_seq(c),next_seq=heap_next_seq;
+ stack_push_value(vm_int(invocation));stack_push_value(vm_int(1)); /* next callback */
+ save_and_restore();
+ CHECK(heap_get_seq(live)==live_seq&&heap_get_seq(c)==target_seq&&heap_next_seq==next_seq);
+ CHECK(stack_ptr==2&&stack[0].i==invocation&&stack[1].i==1);
+ snapshot=heap_get_delegate_page(invocation);
+ CHECK(snapshot->index==-1&&snapshot->delegate.live_slot==live&&snapshot->delegate.live_seq==live_seq);
+ delegate_erase(heap_get_delegate_page(live),a,41); /* self-erase after restoring */
+ CHECK(delegate_get(snapshot,stack[1].i,&o,&f)&&o==c&&f==43);
+ CHECK(!delegate_get(snapshot,2,&o,&f));
+ heap_unref(invocation);stack_ptr=0;
+ /* A cancelled callback must also stay cancelled when it is unregistered
+    after restoring, not just when the serialized live list lacked it. */
+ snapshot=copy_page(heap_get_delegate_page(live));snapshot->index=-1;
+ snapshot->delegate.live_slot=live;snapshot->delegate.live_seq=live_seq;
+ invocation=heap_alloc_page(snapshot);save_and_restore();
+ delegate_erase(heap_get_delegate_page(live),c,43);
+ CHECK(!delegate_get(heap_get_delegate_page(invocation),0,&o,&f));
+ heap_unref(invocation);
+ /* Arrays share the metadata union with delegates. Reuse that exact cache
+    entry for a normal delegate, a snapshot copy, then an old JSON snapshot. */
+ struct page *poison=alloc_page(ARRAY_PAGE,AIN_INT,3);
+ poison->array.struct_type=live;poison->array.rank=(int)live_seq;free_page(poison);
+ struct page *ordinary=delegate_new_from_method(c,43);
+ CHECK(ordinary==poison&&ordinary->delegate.live_slot==-1&&ordinary->delegate.live_seq==0);
+ copied=copy_page(ordinary);
+ CHECK(copied->index==0&&copied->delegate.live_slot==-1&&copied->delegate.live_seq==0);
+ free_page(copied);
+ cJSON *normal_json=resume_page_to_json(ordinary);
+ CHECK(!cJSON_GetObjectItem(normal_json,"live-slot")&&!cJSON_GetObjectItem(normal_json,"live-seq"));
+ ordinary->index=-1;ordinary->delegate.live_slot=live;ordinary->delegate.live_seq=live_seq;
+ cJSON *old_json=resume_page_to_json(ordinary);
+ cJSON_DeleteItemFromObject(old_json,"live-slot");cJSON_DeleteItemFromObject(old_json,"live-seq");
+ free_page(ordinary);
+ poison=alloc_page(ARRAY_PAGE,AIN_INT,3);CHECK(poison==ordinary);
+ poison->array.struct_type=live;poison->array.rank=(int)live_seq;free_page(poison);
+ invocation=heap_alloc_slot(VM_PAGE);load_json_page(invocation,old_json);
+ snapshot=heap_get_delegate_page(invocation);
+ CHECK(snapshot==poison&&snapshot->index==-1&&snapshot->delegate.live_slot==-1&&snapshot->delegate.live_seq==0);
+ /* The source is empty, but old snapshots have no reliable source link:
+    their still-live callback must run rather than using array cache debris. */
+ CHECK(delegate_get(snapshot,0,&o,&f)&&o==c&&f==43);
+ heap_unref(invocation);cJSON_Delete(old_json);
+ poison=alloc_page(ARRAY_PAGE,AIN_INT,3);
+ poison->array.struct_type=live;poison->array.rank=(int)live_seq;free_page(poison);
+ invocation=heap_alloc_slot(VM_PAGE);load_json_page(invocation,normal_json);
+ ordinary=heap_get_delegate_page(invocation);
+ CHECK(ordinary==poison&&ordinary->index==0&&ordinary->delegate.live_slot==-1&&ordinary->delegate.live_seq==0);
+ CHECK(delegate_get(ordinary,0,&o,&f)&&o==c&&f==43);
+ heap_unref(invocation);cJSON_Delete(normal_json);
+ return 0;
+}
 int run_tests(void){
  heap_init();int o,f;
  /* Base camp: a UI object still registered in a per-frame delegate is freed;
@@ -159,9 +271,8 @@ int run_tests(void){
  int env6;int dg6=new_closure_delegate(-1,10,&env6);CHECK(env6==x);
  heap_set_page(k,delegate_clear(heap_get_delegate_page(k)));CHECK(heap[env6].ref==1);
  heap_unref(k);CHECK(heap[env6].ref==1&&call_all(dg6,&o,&f)==1);
- /* Rance 10 Gartia Turn 4: callback #0 erasing itself still runs #1, while
-    callback #0 erasing #1 (or clearing the delegate) prevents #1 from firing
-    and still runs #2 cleanly. */
+ /* Mutation during dispatch: self-erasing must not skip the next live entry,
+    while cancelling that entry prevents it from firing and preserves #2. */
  int m0=new_object(),m1=new_object(),m2=new_object();
  int mdg=heap_alloc_page(delegate_new_from_method(m0,21));
  heap_set_page(mdg,delegate_append(heap_get_delegate_page(mdg),m1,22));
@@ -185,6 +296,9 @@ int run_tests(void){
  CHECK(!delegate_get(heap_get_delegate_page(cinv),0,&o,&f));
  heap_unref(cinv);CHECK(heap_get_seq(cenv)==0);
  heap_unref(cdg);heap_unref(m0);heap_unref(m1);heap_unref(m2);
+ int result=test_resume_snapshot(1);if(result)return result;
+ result=test_resume_snapshot(0x80000005u);if(result)return result;
+ result=test_resume_snapshot(0xfffffff0u);if(result)return result;
  return 0;}
 `;
 fs.writeFileSync(path.join(build,'delegates-test.c'),source);
@@ -194,4 +308,4 @@ assert.equal(r.status,0,r.stderr||r.stdout);
 let vmError=0;
 const {instance}=await WebAssembly.instantiate(fs.readFileSync(wasm),{env:{vm_error(line){vmError=line;throw new Error(`VM_ERROR at generated line ${line}`);}}});
 const line=instance.exports.run_tests();assert.equal(line,0,`C failure ${line}: ${source.split('\n')[line-1]}`);
-console.log('PASS: stale delegate entries never release a reused slot (base camp postEvent survives per-frame calls and entries going stale mid-call), owned closures are released once, erase removes the live entry, prune keeps live entries in order.');
+console.log('PASS: delegate ownership, stale-slot pruning and mutation during dispatch; production JSON heap save/restore retains snapshot links and uint32 generations, resumes remaining callbacks, skips cancellations, and safely loads old snapshots after array-cache reuse.');

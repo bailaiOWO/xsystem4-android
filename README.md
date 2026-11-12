@@ -25,6 +25,17 @@
 兰斯6/7/8/9 的“可玩”为此前适配记录，不代表本次重新验证了完整流程或通关。
 兰斯10 的当前限制见[已知问题](#已知问题)，不要把宿主机测试通过当成真机兼容性结论。
 
+### 最新修复（2026-11-12）
+
+- 合入 [PR #1](https://github.com/bailaiOWO/xsystem4-android/pull/1)，保留其委托、存档、Android 客户端和构建链改动。
+- **通用 `String.Split` 语义修复**：忽略首尾及连续分隔符产生的空片段；请求保留分隔符时，仍逐个返回分隔字符。
+  修复闭合参数被错误拆成三项、导致敌方切换、支援状态去除、DOWN、战斗结果等动作不执行的问题；没有 Boss 或剧情名称特判。
+- **委托快照存读档**：保存并恢复原委托的槽号和代数；旧档缺少字段时明确初始化，避免继承缓存页残留。
+  同时保留完整无符号 32 位堆代数，防止长时间运行后的高位序号在读档时被截断。
+- 验证：24 项核心回归通过；核对游戏的全部 42 个 `String.Split` 调用点，并在平板独立进程中调用新原生库，
+  逐项验证 5,209 个游戏语料、存档和边界用例的 token 数及原始字节，其中包含平板已有的 52 份存档注释。
+  这不是所有战斗或完整游戏流程验收；已触发的剧情结果不会自动撤销，更新后应读取异常事件发生前的存档。
+
 ## 中文汉化版做了什么
 
 中文汉化版和日文原版最大的区别在于**一套游戏里混着三种编码**，而上游代码默认"一种编码打天下"。
@@ -83,7 +94,8 @@ AliceSoft 后期作品（兰斯8 Rance Quest、兰斯9 赫尔曼革命等）的�
 里面装的是 **WMV1 视频 + WMA2 音频**；早期作品则是 MPEG-PS。
 
 项目提供 FFmpeg 静态库的交叉编译和自动探测（`libavformat/libavcodec/libavutil/libswscale`）。
-**只有实际链接 FFmpeg 的 APK 才支持 ASF/WMV**；依赖编译失败时构建脚本会警告并继续使用 pl_mpeg，不应仅凭 APK 构建成功判断动画已支持。
+**只有实际链接 FFmpeg 的 APK 才支持 ASF/WMV**；标准构建脚本现在会在 FFmpeg 编译或必要解码符号校验失败时终止。
+可用 `SKIP_FFMPEG=1` 显式跳过其编译；单独配置 CMake 时仍可能选择 pl_mpeg，须核对实际后端，不能仅凭 APK 构建成功判断动画支持。
 
 - 引擎侧：`xsystem4/src/movie_ffmpeg.c` 作为动画后端（`USE_FFMPEG=ON` 且依赖存在时），pl_mpeg 作为
   没有 ffmpeg 时的回退（那种情况只能放 MPEG-PS）
@@ -100,7 +112,7 @@ AliceSoft 后期作品（兰斯8 Rance Quest、兰斯9 赫尔曼革命等）的�
 
 本机已用真实 `OP1A/OP1B/OP1C/ED2B.apeg` 完成全部 22,678 帧解码顺序、结束及前后定位一致性检查，
 并用项目着色器完成宿主机 GPU 抽帧呈现。**这些不等于 Android 设备上的音画同步、跳过和前后台切换验收**；
-当前没有连接设备，新增播放路径仍需在手机/平板上确认。
+本次字符串与快照修复未重新执行 OP/ED 的设备播放验收。
 
 ## 构建
 
@@ -109,13 +121,13 @@ AliceSoft 后期作品（兰斯8 Rance Quest、兰斯9 赫尔曼革命等）的�
 ### 依赖
 
 - 建议 Linux；CI 使用 Ubuntu。Windows 本地回归可用，原生交叉编译还需要离线依赖准备。
-- JDK 17+、Android SDK（含 Platform 34）、Android NDK r23+（CI 使用 runner 提供的 NDK）
+- JDK 17+（CI 显式使用 JDK 21）、Android SDK（含 Platform 34）、Android NDK r23+（CI 使用 runner 提供的 NDK）
 - CMake 3.21+、Ninja、flex、bison，以及 FFmpeg 脚本所需的编译工具
 
 ### 推荐：GitHub Actions 构建
 
 向主仓库推送或手动运行 [Build workflow](.github/workflows/build.yml)。它会递归检出子模块、应用补丁、
-生成 GBK 表并下载字体，再编译三个 ABI 和 Debug APK。成功后下载 `xsystem4-chinese-debug-apk` artifact。
+生成 GBK 表、下载并校验字体，执行核心离线回归门禁，再编译三个 ABI 和 Debug APK。成功后下载 `xsystem4-chinese-debug-apk` artifact。
 这不是自动发布到 Releases，也不是正式签名的发行构建。
 
 ### 本地构建
@@ -231,8 +243,9 @@ Android/data/io.github.kichikuou.xsystem4/files/战国兰斯/
 
 ### 发布与构建
 
-- 本次准备没有重建三 ABI APK，也没有完成新 APK 的设备验收；当前 CI 尚未执行 24 项本地核心回归。
-- 最低系统声明与原生 API 级别不一致、FFmpeg 失败时回退、字体校验只警告、公开 Debug 签名，详见[构建](#构建)及[支持环境](#支持环境)。
+- CI 已接入核心离线回归门禁。本次增量修复构建 arm64-v8a，设备验证范围见[最新修复](#最新修复2026-11-12)；不等于三 ABI 或完整游戏流程的实机验收。
+- 最低系统声明与原生 API 级别不一致、公开 Debug 签名仍需注意，详见[构建](#构建)及[支持环境](#支持环境)。
+  FFmpeg 编译/符号校验失败、Noto 字体校验不一致现在会终止标准构建，不再只警告后继续。
 - `collect-licenses.sh` 的应用内许可列表尚未补齐新增字体、CuNNy2 和 FFmpeg；正式分发前需完善许可证收集，
   并核对组合分发要求。源码/资源中已有的许可文件不能当作应用内许可菜单已完整的证明。
 - 公开 [Actions 运行 37279287268](https://github.com/bailaiOWO/xsystem4-android/actions/runs/37279287268)

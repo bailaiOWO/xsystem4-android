@@ -12117,10 +12117,10 @@ index 0000000..0db1c69
 +}
 diff --git a/src/hll/NewerLibs.c b/src/hll/NewerLibs.c
 new file mode 100644
-index 0000000..c5ab42a
+index 0000000..806164a
 --- /dev/null
 +++ b/src/hll/NewerLibs.c
-@@ -0,0 +1,411 @@
+@@ -0,0 +1,408 @@
 +/* Copyright (C) 2026 xsystem4-android contributors
 + *
 + * Small HLL libraries used by newer scripts (Rance X and friends).
@@ -12428,12 +12428,9 @@ index 0000000..c5ab42a
 +			s = end;
 +		}
 +		if (separator) {
-+			/* Treat adjacent delimiters as one run in a plain split: &&/||
-+			 * must not introduce an unconditional empty battle expression.
-+			 * Keep boundary fields for serialized data (notably save comments).
-+			 * ColorText instead requests each separator as its own token. */
++			/* Omit empty fields; contain_separator only adds separator tokens. */
 +			union vm_value token;
-+			if (cursor > start || (!contain_separator && cursor == (*self)->text)) {
++			if (cursor > start) {
 +				token.i = heap_alloc_string(make_string(start,cursor-start));
 +				out = array_pushback(out,token,AIN_ARRAY_STRING,-1);
 +			}
@@ -12445,7 +12442,7 @@ index 0000000..c5ab42a
 +		}
 +		cursor = next;
 +	}
-+	if (cursor > start || !contain_separator) {
++	if (cursor > start) {
 +		union vm_value token = {.i = heap_alloc_string(make_string(start,cursor-start))};
 +		out = array_pushback(out,token,AIN_ARRAY_STRING,-1);
 +	}
@@ -16110,7 +16107,7 @@ index e90024a..e8cc8b6 100644
  	if (mc->voice >= 0)
  		mixer_stream_set_volume(mc->voice, volume);
 diff --git a/src/page.c b/src/page.c
-index 250653f..b9fac71 100644
+index 250653f..5c306fb 100644
 --- a/src/page.c
 +++ b/src/page.c
 @@ -21,6 +21,7 @@
@@ -16129,7 +16126,18 @@ index 250653f..b9fac71 100644
  };
  
  const char *pagetype_string(enum page_type type)
-@@ -86,9 +88,11 @@ union vm_value variable_initval(enum ain_data_type type)
+@@ -74,6 +76,10 @@ struct page *alloc_page(enum page_type type, int type_index, int nr_vars)
+ 	page->type = type;
+ 	page->index = type_index;
+ 	page->nr_vars = nr_vars;
++	if (type == DELEGATE_PAGE) {
++		page->delegate.live_slot = -1;
++		page->delegate.live_seq = 0;
++	}
+ 	return page;
+ }
+ 
+@@ -86,9 +92,11 @@ union vm_value variable_initval(enum ain_data_type type)
  		heap[slot].s = string_ref(&EMPTY_STRING);
  		return (union vm_value) { .i = slot };
  	case AIN_STRUCT:
@@ -16141,7 +16149,7 @@ index 250653f..b9fac71 100644
  	case AIN_DELEGATE:
  		slot = heap_alloc_slot(VM_PAGE);
  		heap_set_page(slot, NULL);
-@@ -103,8 +107,10 @@ void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
+@@ -103,8 +111,10 @@ void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
  	switch (type) {
  	case AIN_STRING:
  	case AIN_STRUCT:
@@ -16152,7 +16160,7 @@ index 250653f..b9fac71 100644
  	case AIN_REF_TYPE:
  		if (v.i == -1)
  			break;
-@@ -121,6 +127,12 @@ void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
+@@ -121,6 +131,12 @@ void variable_fini(union vm_value v, enum ain_data_type type, bool call_dtor)
  enum ain_data_type array_type(enum ain_data_type type)
  {
  	switch (type) {
@@ -16165,7 +16173,7 @@ index 250653f..b9fac71 100644
  	case AIN_ARRAY_INT:
  	case AIN_REF_ARRAY_INT:
  		return AIN_INT;
-@@ -151,6 +163,13 @@ enum ain_data_type array_type(enum ain_data_type type)
+@@ -151,6 +167,13 @@ enum ain_data_type array_type(enum ain_data_type type)
  	}
  }
  
@@ -16179,7 +16187,7 @@ index 250653f..b9fac71 100644
  enum ain_data_type variable_type(struct page *page, int varno, int *struct_type, int *array_rank)
  {
  	switch (page->type) {
-@@ -161,6 +180,7 @@ enum ain_data_type variable_type(struct page *page, int varno, int *struct_type,
+@@ -161,6 +184,7 @@ enum ain_data_type variable_type(struct page *page, int varno, int *struct_type,
  			*array_rank = ain->globals[varno].type.rank;
  		return ain->globals[varno].type.data;
  	case LOCAL_PAGE:
@@ -16187,7 +16195,7 @@ index 250653f..b9fac71 100644
  		if (struct_type)
  			*struct_type = ain->functions[page->index].vars[varno].type.struc;
  		if (array_rank)
-@@ -173,12 +193,17 @@ enum ain_data_type variable_type(struct page *page, int varno, int *struct_type,
+@@ -173,12 +197,17 @@ enum ain_data_type variable_type(struct page *page, int varno, int *struct_type,
  			*array_rank = ain->structures[page->index].members[varno].type.rank;
  		return ain->structures[page->index].members[varno].type.data;
  	case ARRAY_PAGE:
@@ -16206,7 +16214,19 @@ index 250653f..b9fac71 100644
  		// XXX: we return void here because objects in a delegate page aren't
  		//      reference counted
  		return AIN_VOID;
-@@ -242,7 +267,7 @@ int alloc_struct(int no)
+@@ -219,7 +248,10 @@ struct page *copy_page(struct page *src)
+ 	if (!src)
+ 		return NULL;
+ 	struct page *dst = alloc_page(src->type, src->index, src->nr_vars);
+-	dst->array = src->array;
++	if (src->type == DELEGATE_PAGE)
++		dst->delegate = src->delegate;
++	else
++		dst->array = src->array;
+ 
+ 	for (int i = 0; i < src->nr_vars; i++) {
+ 		dst->values[i] = vm_copy(src->values[i], variable_type(src, i, NULL, NULL));
+@@ -242,7 +274,7 @@ int alloc_struct(int no)
  	return slot;
  }
  
@@ -16215,7 +16235,7 @@ index 250653f..b9fac71 100644
  {
  	struct ain_struct *s = &ain->structures[no];
  	for (int i = 0; i < s->nr_members; i++) {
-@@ -250,15 +275,28 @@ void init_struct(int no, int slot)
+@@ -250,15 +282,28 @@ void init_struct(int no, int slot)
  			init_struct(s->members[i].type.struc, heap[slot].page->values[i].i);
  		}
  	}
@@ -16246,7 +16266,7 @@ index 250653f..b9fac71 100644
  		vm_call(s->destructor, slot);
  	}
  }
-@@ -281,6 +319,8 @@ static enum ain_data_type unref_array_type(enum ain_data_type type)
+@@ -281,6 +326,8 @@ static enum ain_data_type unref_array_type(enum ain_data_type type)
  	case AIN_REF_ARRAY_LONG_INT:  return AIN_ARRAY_LONG_INT;
  	case AIN_REF_ARRAY_DELEGATE:  return AIN_ARRAY_DELEGATE;
  	case AIN_ARRAY_TYPE:          return type;
@@ -16255,7 +16275,7 @@ index 250653f..b9fac71 100644
  	default: VM_ERROR("Attempt to array allocate non-array type");
  	}
  }
-@@ -316,6 +356,8 @@ struct page *realloc_array(struct page *src, int rank, union vm_value *dimension
+@@ -316,6 +363,8 @@ struct page *realloc_array(struct page *src, int rank, union vm_value *dimension
  {
  	if (rank < 1)
  		VM_ERROR("Tried to allocate 0-rank array");
@@ -16264,7 +16284,7 @@ index 250653f..b9fac71 100644
  	if (!src && !dimensions->i)
  		return NULL;
  	if (!src)
-@@ -388,14 +430,19 @@ void array_copy(struct page *dst, int dst_i, struct page *src, int src_i, int n)
+@@ -388,14 +437,19 @@ void array_copy(struct page *dst, int dst_i, struct page *src, int src_i, int n)
  		VM_ERROR("Not an array");
  	if (!array_index_ok(dst, dst_i) || !array_index_ok(src, src_i))
  		VM_ERROR("Out of bounds array access");
@@ -16286,7 +16306,7 @@ index 250653f..b9fac71 100644
  		enum ain_data_type type = array_type(dst->a_type);
  		variable_set(dst, dst_i+i, type, vm_copy(src->values[src_i+i], type));
  	}
-@@ -407,6 +454,11 @@ int array_fill(struct page *dst, int dst_i, int n, union vm_value v)
+@@ -407,6 +461,11 @@ int array_fill(struct page *dst, int dst_i, int n, union vm_value v)
  		return 0;
  	if (dst->type != ARRAY_PAGE)
  		VM_ERROR("Not an array");
@@ -16298,7 +16318,7 @@ index 250653f..b9fac71 100644
  
  	// clamp (dst_i, dst_i+n) to range of array
  	if (dst_i < 0) {
-@@ -415,10 +467,9 @@ int array_fill(struct page *dst, int dst_i, int n, union vm_value v)
+@@ -415,10 +474,9 @@ int array_fill(struct page *dst, int dst_i, int n, union vm_value v)
  	}
  	if (dst_i >= dst->nr_vars)
  		return 0;
@@ -16310,7 +16330,7 @@ index 250653f..b9fac71 100644
  	for (int i = 0; i < n; i++) {
  		variable_set(dst, dst_i+i, type, vm_copy(v, type));
  	}
-@@ -454,6 +505,8 @@ struct page *array_popback(struct page *dst)
+@@ -454,6 +512,8 @@ struct page *array_popback(struct page *dst)
  		VM_ERROR("Not an array");
  	if (dst->array.rank != 1)
  		VM_ERROR("Tried popping from a multi-dimensional array");
@@ -16319,7 +16339,7 @@ index 250653f..b9fac71 100644
  
  	union vm_value dims[1] = { (union vm_value) { .i = dst->nr_vars - 1 } };
  	dst = realloc_array(dst, 1, dims, dst->a_type, dst->array.struct_type, false);
-@@ -709,6 +762,7 @@ struct page *delegate_new_from_method(int obj, int fun)
+@@ -709,6 +769,7 @@ struct page *delegate_new_from_method(int obj, int fun)
  	page->values[0].i = obj;
  	page->values[1].i = fun;
  	page->values[2].i = heap_get_seq(obj);
@@ -16327,7 +16347,7 @@ index 250653f..b9fac71 100644
  	return page;
  }
  
-@@ -741,6 +795,7 @@ struct page *delegate_append(struct page *dst, int obj, int fun)
+@@ -741,6 +802,7 @@ struct page *delegate_append(struct page *dst, int obj, int fun)
  	dst->values[dst->nr_vars+1].i = fun;
  	dst->values[dst->nr_vars+2].i = heap_get_seq(obj);
  	dst->nr_vars += 3;
@@ -16335,7 +16355,7 @@ index 250653f..b9fac71 100644
  	return dst;
  }
  
-@@ -766,25 +821,81 @@ int delegate_numof(struct page *page)
+@@ -766,25 +828,81 @@ int delegate_numof(struct page *page)
  	return page->nr_vars / 3;
  }
  
@@ -16424,7 +16444,7 @@ index 250653f..b9fac71 100644
  struct page *delegate_plusa(struct page *dst, struct page *add)
  {
  	if (!add)
-@@ -823,6 +934,8 @@ struct page *delegate_clear(struct page *page)
+@@ -823,6 +941,8 @@ struct page *delegate_clear(struct page *page)
  	if (page->type != DELEGATE_PAGE)
  		VM_ERROR("Not a delegate");
  	for (int i = 0; i < page->nr_vars; i += 3) {
@@ -16433,7 +16453,7 @@ index 250653f..b9fac71 100644
  		page->values[i].i = -1;
  		page->values[i+1].i = -1;
  		page->values[i+2].i = 0;
-@@ -839,17 +952,32 @@ bool delegate_get(struct page *page, int i, int *obj_out, int *fun_out)
+@@ -839,17 +959,32 @@ bool delegate_get(struct page *page, int i, int *obj_out, int *fun_out)
  	if (page->type != DELEGATE_PAGE)
  		VM_ERROR("Not a delegate");
  	while (i*3 < page->nr_vars) {
@@ -22814,7 +22834,7 @@ index 0000000..4a5a324
 +}
 +#endif
 diff --git a/src/resume.c b/src/resume.c
-index 1c57fac..67e92f7 100644
+index 1c57fac..f19426e 100644
 --- a/src/resume.c
 +++ b/src/resume.c
 @@ -25,6 +25,8 @@
@@ -22844,7 +22864,7 @@ index 1c57fac..67e92f7 100644
  	VM_ERROR("Invalid page type: %s", str);
  }
  
-@@ -77,6 +81,11 @@ static cJSON *resume_page_to_json(struct page *page)
+@@ -77,6 +81,14 @@ static cJSON *resume_page_to_json(struct page *page)
  	if (page->type == ARRAY_PAGE) {
  		cJSON_AddNumberToObject(json, "struct-type", page->array.struct_type);
  		cJSON_AddNumberToObject(json, "rank", page->array.rank);
@@ -22853,10 +22873,13 @@ index 1c57fac..67e92f7 100644
 +		cJSON_AddNumberToObject(json, "parent-page", page->local.parent_page);
 +		cJSON_AddNumberToObject(json, "struct-seq", page->local.struct_seq);
 +		cJSON_AddNumberToObject(json, "parent-seq", page->local.parent_seq);
++	} else if (page->type == DELEGATE_PAGE && page->index == -1) {
++		cJSON_AddNumberToObject(json, "live-slot", page->delegate.live_slot);
++		cJSON_AddNumberToObject(json, "live-seq", page->delegate.live_seq);
  	}
  
  	cJSON *values = cJSON_CreateIntArray_cb(page->nr_vars, get_number, page->values);
-@@ -116,6 +125,7 @@ static cJSON *funcall_to_json(struct function_call *call)
+@@ -116,6 +128,7 @@ static cJSON *funcall_to_json(struct function_call *call)
  {
  	cJSON *json = cJSON_CreateObject();
  	cJSON_AddNumberToObject(json, "function", call->fno);
@@ -22864,7 +22887,7 @@ index 1c57fac..67e92f7 100644
  	cJSON_AddNumberToObject(json, "return-address", call->return_address);
  	cJSON_AddNumberToObject(json, "local-page", call->page_slot);
  	cJSON_AddNumberToObject(json, "struct-page", call->struct_page);
-@@ -294,6 +304,16 @@ static void save_heap_to_rsave(struct rsave *rs)
+@@ -294,6 +307,16 @@ static void save_heap_to_rsave(struct rsave *rs)
  	}
  }
  
@@ -22881,7 +22904,7 @@ index 1c57fac..67e92f7 100644
  static void save_call_stack_to_rsave(struct rsave *rs)
  {
  	rs->nr_call_frames = call_stack_ptr + 1;
-@@ -326,8 +346,9 @@ static void save_call_stack_to_rsave(struct rsave *rs)
+@@ -326,8 +349,9 @@ static void save_call_stack_to_rsave(struct rsave *rs)
  		prev_func = func;
  	}
  	rs->ip = rs->return_records[call_stack_ptr];
@@ -22893,7 +22916,7 @@ index 1c57fac..67e92f7 100644
  }
  
  static void save_stack_to_rsave(struct rsave *rs)
-@@ -382,23 +403,25 @@ static int save_rsave_image(const char *key, const char *path)
+@@ -382,23 +406,25 @@ static int save_rsave_image(const char *key, const char *path)
  	if (!save)
  		return 0;
  	char *full_path = savedir_path(path);
@@ -22923,18 +22946,19 @@ index 1c57fac..67e92f7 100644
  }
  
  static int save_json_image(const char *key, const char *path)
-@@ -411,6 +434,10 @@ static int save_json_image(const char *key, const char *path)
+@@ -411,6 +437,11 @@ static int save_json_image(const char *key, const char *path)
  
  int vm_save_image(const char *key, const char *path)
  {
-+	// Our modern closure environments have no representation in the legacy
-+	// RSM schema. JSON preserves their lexical links and sequence checks.
++	// Modern closure environments and delegate invocation snapshots have no
++	// representation in legacy RSM. JSON preserves lexical/live-list links
++	// and their sequence checks.
 +	if (ain->version >= 11)
 +		return save_json_image(key, path);
  	switch (config.save_format) {
  	case SAVE_FORMAT_RSM:
  		return save_rsave_image(key, path);
-@@ -470,8 +497,19 @@ static void load_json_page(int slot, cJSON *json)
+@@ -470,8 +501,25 @@ static void load_json_page(int slot, cJSON *json)
  
  	// allocate page
  	struct page *page = alloc_page(page_type, subtype->valueint, cJSON_GetArraySize(values));
@@ -22952,11 +22976,17 @@ index 1c57fac..67e92f7 100644
 +		page->local.parent_page = parent_page ? type_check(cJSON_Number, parent_page)->valueint : -1;
 +		page->local.struct_seq = struct_seq ? type_check(cJSON_Number, struct_seq)->valuedouble : 0;
 +		page->local.parent_seq = parent_seq ? type_check(cJSON_Number, parent_seq)->valuedouble : 0;
++	} else if (page_type == DELEGATE_PAGE && page->index == -1) {
++		// Old JSON snapshots have no live-list link; never inherit cached metadata.
++		cJSON *live_slot = cJSON_GetObjectItem(json, "live-slot");
++		cJSON *live_seq = cJSON_GetObjectItem(json, "live-seq");
++		page->delegate.live_slot = live_slot ? type_check(cJSON_Number, live_slot)->valueint : -1;
++		page->delegate.live_seq = live_seq ? type_check(cJSON_Number, live_seq)->valuedouble : 0;
 +	}
  
  	// init page variables
  	int i = 0;
-@@ -480,6 +518,7 @@ static void load_json_page(int slot, cJSON *json)
+@@ -480,6 +528,7 @@ static void load_json_page(int slot, cJSON *json)
  		page->values[i].i = item->valueint;
  		i++;
  	}
@@ -22964,7 +22994,18 @@ index 1c57fac..67e92f7 100644
  
  	heap[slot].page = page;
  	heap[slot].type = VM_PAGE;
-@@ -567,6 +606,75 @@ static void load_json_heap(cJSON *json)
+@@ -546,8 +595,8 @@ static void load_json_heap(cJSON *json)
+ 		int slot = type_check(cJSON_Number, cJSON_GetArrayItem(item, 0))->valueint;
+ 		int ref  = type_check(cJSON_Number, cJSON_GetArrayItem(item, 1))->valueint;
+ 		cJSON *value = cJSON_GetArrayItem(item, 2);
+-		int seq = ain->nr_delegates > 0
+-			? type_check(cJSON_Number, cJSON_GetArrayItem(item, 3))->valueint
++		uint32_t seq = ain->nr_delegates > 0
++			? type_check(cJSON_Number, cJSON_GetArrayItem(item, 3))->valuedouble
+ 			: slot;
+ 
+ 		alloc_heap_slot(slot);
+@@ -567,6 +616,75 @@ static void load_json_heap(cJSON *json)
  	}
  }
  
@@ -23040,7 +23081,7 @@ index 1c57fac..67e92f7 100644
  static int resolve_func_symbol(struct rsave_symbol *sym)
  {
  	if (!sym->name)
-@@ -676,6 +784,7 @@ static void load_rsave_struct(int slot, struct rsave_heap_struct *s)
+@@ -676,6 +794,7 @@ static void load_rsave_struct(int slot, struct rsave_heap_struct *s)
  		// TODO: update function pointers using rsave->func_names
  		page->values[i].i = s->slots[i];
  	}
@@ -23048,7 +23089,7 @@ index 1c57fac..67e92f7 100644
  
  	alloc_heap_slot(slot);
  	heap[slot].ref = s->ref;
-@@ -722,8 +831,10 @@ static void load_json_call_stack(cJSON *json)
+@@ -722,8 +841,10 @@ static void load_json_call_stack(cJSON *json)
  	cJSON *item;
  	cJSON_ArrayForEach(item, json) {
  		type_check(cJSON_Object, item);
@@ -23059,7 +23100,7 @@ index 1c57fac..67e92f7 100644
  			.return_address = type_check(cJSON_Number, cJSON_GetObjectItem(item, "return-address"))->valueint,
  			.page_slot      = type_check(cJSON_Number, cJSON_GetObjectItem(item, "local-page"))->valueint,
  			.struct_page    = type_check(cJSON_Number, cJSON_GetObjectItem(item, "struct-page"))->valueint,
-@@ -764,9 +875,9 @@ static void load_rsave_call_stack(struct rsave *save)
+@@ -764,9 +885,9 @@ static void load_rsave_call_stack(struct rsave *save)
  		if (++rr == save->return_records + save->nr_return_records)
  			rr = &save->ip;
  	}
@@ -23072,7 +23113,7 @@ index 1c57fac..67e92f7 100644
  }
  
  static void load_json_stack(cJSON *json)
-@@ -821,10 +932,13 @@ static void load_json_image(const char *key, const char *path)
+@@ -821,13 +942,16 @@ static void load_json_image(const char *key, const char *path)
  		VM_ERROR("Failed to read VM image: '%s'", display_sjis0(path));
  	}
  	cJSON *ip = type_check(cJSON_Number, cJSON_GetObjectItem(save, "ip"));
@@ -23086,8 +23127,12 @@ index 1c57fac..67e92f7 100644
 +	instr_ptr = ip->valueint + save_width - load_width;
  	if (ain->nr_delegates > 0) {
  		cJSON *next_seq = type_check(cJSON_Number, cJSON_GetObjectItem(save, "next_seq"));
- 		heap_next_seq = next_seq->valueint;
-@@ -984,23 +1098,24 @@ static int write_rsave_image_comments(const char *key, const char *path, struct
+-		heap_next_seq = next_seq->valueint;
++		heap_next_seq = next_seq->valuedouble;
+ 	} else {
+ 		heap_next_seq = heap_size;
+ 	}
+@@ -984,23 +1108,24 @@ static int write_rsave_image_comments(const char *key, const char *path, struct
  		save->comments[i] = xstrdup(heap_get_string(comments->values[i].i)->text);
  	}
  
@@ -23116,7 +23161,7 @@ index 1c57fac..67e92f7 100644
  }
  
  static int write_json_image_comments(const char *key, const char *path, struct page *comments)
-@@ -1028,6 +1143,8 @@ static int write_json_image_comments(const char *key, const char *path, struct p
+@@ -1028,6 +1153,8 @@ static int write_json_image_comments(const char *key, const char *path, struct p
  
  int vm_write_image_comments(const char *key, const char *path, struct page *comments)
  {

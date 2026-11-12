@@ -81,16 +81,17 @@ RANCE10_TEST_CLANG=/path/to/clang node tools/test-rance10-all.mjs
 ```
 
 入口顺序执行 24 项核心回归，覆盖 VM 引用/构造调用、50 种游戏使用的 Array 签名、EX/资源读取、
-存读档、消息/输入/布局、字符串处理、错误报告与界面资源等。最新加入：
+存读档、消息/输入/布局、字符串处理、错误报告与界面资源等。其中重点覆盖：
 
 - `test-rance10-atomic-save.mjs`：原子写入错误路径及写入中断时保留旧文件。
 - `test-rance10-load-input.mjs`：读档后根据恢复的 VM 栈还原嵌套等待输入层数。
-- `test-rance10-delegates.mjs`：失效委托项不误释放复用 heap slot 的新对象、闭包所有权与清理。
+- `test-rance10-delegates.mjs`：失效委托项不误释放复用 heap slot 的新对象、闭包所有权与清理；生产 JSON 堆保存/恢复、旧档缓存复用和高位 32 位代数。
+- `test-rance10-string.mjs`：通用空片段省略、闭合指令参数、嵌套条件、分隔符保留、空白及 GBK/SJIS 字符边界。已删除把额外空项作为正确行为的旧断言，不依赖游戏文件。
 
 测试产物写入已忽略的 `build/rance10-tests/`。这些是宿主机 C/WASM 回归，不运行 Android 完整引擎；
 `test-rance10-review-controls.py` 等独立 Python 脚本不包含在这 24 项中，部分还依赖本机游戏资源/路径。
 不要将“24 项通过”描述成所有工具脚本、三 ABI 构建、实机断电或完整游戏流程均通过。
-当前 GitHub workflow 尚未执行此回归入口，上传前需单独运行。
+GitHub workflow 已将此入口作为原生构建前的门禁；本地仍可独立执行上面的命令。
 
 ## 补丁管理
 
